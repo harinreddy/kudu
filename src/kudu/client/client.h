@@ -122,6 +122,7 @@ class RemoteTabletServer;
 class ReplicaController;
 class RetrieveAuthzTokenRpc;
 class ScanBatchDataInterface;
+class TabletInfoProvider;
 class WriteRpc;
 template <class ReqClass, class RespClass>
 class AsyncLeaderMasterRpc; // IWYU pragma: keep
@@ -986,6 +987,7 @@ class KUDU_EXPORT KuduClient : public sp::enable_shared_from_this<KuduClient> {
   friend class internal::RemoteTablet;
   friend class internal::RemoteTabletServer;
   friend class internal::RetrieveAuthzTokenRpc;
+  friend class internal::TabletInfoProvider;
   friend class internal::WriteRpc;
   friend class kudu::AuthzTokenTest;
   friend class kudu::DisableWriteWhenExceedingQuotaTest;
@@ -2563,6 +2565,9 @@ class KUDU_EXPORT KuduSession : public sp::enable_shared_from_this<KuduSession> 
 
   /// @return Client for the session: pointer to the associated client object.
   KuduClient* client() const;
+
+  /// @return Cumulative write operation metrics since the beginning of the session.
+  const ResourceMetrics& GetWriteOpMetrics() const;
 
  private:
   class KUDU_NO_EXPORT Data;
