@@ -14,43 +14,35 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#ifndef KUDU_SERVER_SERVER_BASE_OPTIONS_H
-#define KUDU_SERVER_SERVER_BASE_OPTIONS_H
 
-#include <cstdint>
+#include "kudu/server/default_key_provider.h"
+
 #include <string>
 
-#include "kudu/fs/fs_manager.h"
-#include "kudu/server/webserver_options.h"
-#include "kudu/server/rpc_server.h"
+#include <gtest/gtest.h>
+
+#include "kudu/util/test_macros.h"
+#include "kudu/util/test_util.h"
+
+using std::string;
 
 namespace kudu {
+namespace security {
 
-class Env;
-
-namespace server {
-
-// Options common to both types of servers.
-// The subclass constructor should fill these in with defaults from
-// server-specific flags.
-struct ServerBaseOptions {
-  Env* env;
-
-  FsManagerOpts fs_opts;
-  RpcServerOptions rpc_opts;
-  WebserverOptions webserver_opts;
-
-  std::string dump_info_path;
-  std::string dump_info_format;
-
-  int32_t metrics_log_interval_ms;
-
-  std::string server_key;
-
+class DefaultKeyProviderTest : public KuduTest {
  protected:
-  ServerBaseOptions();
+  DefaultKeyProvider key_provider_;
 };
 
-} // namespace server
+TEST_F(DefaultKeyProviderTest, TestEncryptAndDecrypt) {
+  string key = "foo";
+  string encrypted_key;
+  string decrypted_key;
+  ASSERT_OK(key_provider_.EncryptServerKey(key, &encrypted_key));
+  ASSERT_OK(key_provider_.DecryptServerKey(encrypted_key, &decrypted_key));
+  ASSERT_NE(key, encrypted_key);
+  ASSERT_EQ(key, decrypted_key);
+}
+
+} // namespace security
 } // namespace kudu
-#endif /* KUDU_SERVER_SERVER_BASE_OPTIONS_H */

@@ -15,13 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <cstring>
 #include <sys/stat.h>
 
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <functional>
 #include <initializer_list>
@@ -42,6 +42,7 @@
 #include <glog/stl_logging.h>
 #include <gmock/gmock-matchers.h>
 #include <gtest/gtest.h>
+#include <rapidjson/document.h>
 
 #include "kudu/cfile/cfile-test-base.h"
 #include "kudu/cfile/cfile_util.h"
@@ -139,6 +140,7 @@
 #include "kudu/util/test_util.h"
 #include "kudu/util/url-coding.h"
 
+DECLARE_bool(encrypt_data_at_rest);
 DECLARE_bool(fs_data_dirs_consider_available_space);
 DECLARE_bool(hive_metastore_sasl_enabled);
 DECLARE_bool(show_values);
@@ -1133,7 +1135,7 @@ TEST_F(ToolTest, TestModeHelp) {
         "data_size.*Summarize the data size",
         "dump.*Dump a Kudu filesystem",
         "copy_from_remote.*Copy a tablet replica from a remote server",
-        "copy_from_local.*Copy a tablet replica from local filesystem",
+        "copy_from_local.*Copy tablet replicas from local filesystem",
         "delete.*Delete tablet replicas from the local filesystem",
         "list.*Show list of tablet replicas",
     };
@@ -1171,7 +1173,7 @@ TEST_F(ToolTest, TestModeHelp) {
   }
   {
     const vector<string> kLocalReplicaCopyFromRemoteRegexes = {
-        "Copy a tablet replica from local filesystem",
+        "Copy tablet replicas from local filesystem",
     };
     NO_FATALS(RunTestHelp("local_replica copy_from_local --help",
                           kLocalReplicaCopyFromRemoteRegexes));
@@ -1187,17 +1189,19 @@ TEST_F(ToolTest, TestModeHelp) {
         "get_flags.*Get the gflags",
         "run.*Run a Kudu Master",
         "set_flag.*Change a gflag value",
+        "set_flag_for_all.*Change a gflag value",
         "status.*Get the status",
         "timestamp.*Get the current timestamp",
         "list.*List masters in a Kudu cluster",
         "add.*Add a master to the Kudu cluster",
-        "remove.*Remove a master from the Kudu cluster"
+        "remove.*Remove a master from the Kudu cluster",
     };
     NO_FATALS(RunTestHelp(kCmd, kMasterModeRegexes));
     NO_FATALS(RunTestHelpRpcFlags(kCmd,
         { "dump_memtrackers",
           "get_flags",
           "set_flag",
+          "set_flag_for_all",
           "status",
           "timestamp",
           "list",
@@ -1361,6 +1365,7 @@ TEST_F(ToolTest, TestModeHelp) {
         "dump_memtrackers.*Dump the memtrackers",
         "get_flags.*Get the gflags",
         "set_flag.*Change a gflag value",
+        "set_flag_for_all.*Change a gflag value",
         "run.*Run a Kudu Tablet Server",
         "state.*Operate on the state",
         "status.*Get the status",
@@ -1373,6 +1378,7 @@ TEST_F(ToolTest, TestModeHelp) {
         { "dump_memtrackers",
           "get_flags",
           "set_flag",
+          "set_flag_for_all",
           "status",
           "timestamp",
           "list",
@@ -1584,6 +1590,14 @@ TEST_F(ToolTest, TestFsDumpUuid) {
 }
 
 TEST_F(ToolTest, TestPbcTools) {
+  // It's pointless to run these tests in an encrypted environment, as it uses
+  // instance files to test pbc tools, which are not encrypted anyway. The tests
+  // also make assumptions about the contents of the instance files, which are
+  // different on encrypted servers, as they contain an extra server_key field,
+  // which would make these tests break.
+  if (FLAGS_encrypt_data_at_rest) {
+    GTEST_SKIP();
+  }
   const string kTestDir = GetTestPath("test");
   string uuid;
   string instance_path;
@@ -1777,6 +1791,7 @@ TEST_F(ToolTest, TestPbcToolsOnMultipleBlocks) {
 
   // Generate a block container metadata file.
   string metadata_path;
+  string encryption_args;
   {
     // Open FsManager to write file later.
     FsManager fs(env_, FsManagerOpts(kTestDir));
@@ -1809,9 +1824,12 @@ TEST_F(ToolTest, TestPbcToolsOnMultipleBlocks) {
     }
     ASSERT_EQ(1, metadata_files.size());
     metadata_path = metadata_files[0];
-  }
 
-  string encryption_args = env_->IsEncryptionEnabled() ? GetEncryptionArgs() : "";
+    if (env_->IsEncryptionEnabled()) {
+      encryption_args = GetEncryptionArgs() + " --instance_file=" +
+          fs.GetInstanceMetadataPath(kTestDir);
+      }
+  }
 
   // Test default dump
   {
@@ -2128,7 +2146,11 @@ TEST_F(ToolTest, TestWalDump) {
   }
 
   string wal_path = fs.GetWalSegmentFileName(kTestTablet, 1);
-  string encryption_args = env_->IsEncryptionEnabled() ? GetEncryptionArgs() : "";
+  string encryption_args;
+  if (env_->IsEncryptionEnabled()) {
+    encryption_args = GetEncryptionArgs() + " --instance_file=" +
+        fs.GetInstanceMetadataPath(kTestDir);
+  }
   string stdout;
   for (const auto& args : { Substitute("wal dump $0 $1", wal_path, encryption_args),
                             Substitute("local_replica dump wals --fs_wal_dir=$0 $1 $2",
@@ -2309,9 +2331,14 @@ TEST_F(ToolTest, TestWalDumpWithAlterSchema) {
 
   string wal_path = fs.GetWalSegmentFileName(kTestTablet, 1);
   string stdout;
-  for (const auto& args : { Substitute("wal dump $0", wal_path),
-                            Substitute("local_replica dump wals --fs_wal_dir=$0 $1",
-                                       kTestDir, kTestTablet)
+  string encryption_args;
+  if (env_->IsEncryptionEnabled()) {
+    encryption_args = GetEncryptionArgs() + " --instance_file=" +
+        fs.GetInstanceMetadataPath(kTestDir);
+  }
+  for (const auto& args : { Substitute("wal dump $0 $1", encryption_args, wal_path),
+                            Substitute("local_replica dump wals --fs_wal_dir=$0 $1 $2",
+                                       kTestDir, encryption_args, kTestTablet)
                            }) {
     SCOPED_TRACE(args);
     for (const auto& print_entries : { "true", "1", "yes", "decoded" }) {
@@ -4041,7 +4068,13 @@ TEST_F(ToolTest, TestLocalReplicaCMetaOps) {
   for (int i = 0; i < kNumTabletServers; ++i) {
     ts_uuids.emplace_back(mini_cluster_->mini_tablet_server(i)->uuid());
   }
-  string encryption_args = env_->IsEncryptionEnabled() ? GetEncryptionArgs() : "";
+  string encryption_args;
+
+  if (env_->IsEncryptionEnabled()) {
+    encryption_args = GetEncryptionArgs() + " --instance_file=" +
+        JoinPathSegments(mini_cluster_->mini_tablet_server(0)->options()->fs_opts.wal_root,
+                         "instance");
+  }
   const string& flags =
       Substitute("-fs-wal-dir $0 $1",
                  mini_cluster_->mini_tablet_server(0)->options()->fs_opts.wal_root,
@@ -6918,6 +6951,12 @@ static void CreateTableWithFlushedData(const string& table_name,
   KuduSchema schema;
   ASSERT_OK(schema_builder.Build(&schema));
 
+
+#if defined(THREAD_SANITIZER)
+  constexpr auto kNumRows = 1000;
+#else
+  constexpr auto kNumRows = 10000;
+#endif
   // Create a table and write some data to it.
   TestWorkload workload(cluster);
   workload.set_schema(schema);
@@ -6927,7 +6966,7 @@ static void CreateTableWithFlushedData(const string& table_name,
   workload.Setup();
   workload.Start();
   ASSERT_EVENTUALLY([&]() {
-    ASSERT_GE(workload.rows_inserted(), 10000);
+    ASSERT_GE(workload.rows_inserted(), kNumRows);
   });
   workload.StopAndJoin();
 
@@ -7745,8 +7784,11 @@ TEST_F(ToolTest, ConnectionNegotiationTimeoutOption) {
     auto s = RunActionStderrString(Substitute(kPattern, rpc_addr, 10, 11), &msg);
     ASSERT_TRUE(s.IsRuntimeError());
     ASSERT_STR_CONTAINS(msg, Substitute(
-        "Timed out: Client connection negotiation failed: client connection to "
-        "$0: received 0 of 4 requested bytes", rpc_addr));
+        "Timed out: Client connection negotiation failed: "
+        "client connection to $0", rpc_addr));
+    ASSERT_STR_MATCHES(msg,
+        "(Timeout exceeded waiting to connect)|"
+        "(received|sent) 0 of .* requested bytes");
   }
 
   {
@@ -7999,7 +8041,10 @@ TEST_F(ToolTest, TestLocalReplicaCopyLocal) {
 }
 
 TEST_F(ToolTest, TestRebuildTserverByLocalReplicaCopy) {
-  SKIP_IF_SLOW_NOT_ALLOWED();
+  // Local copies are not supported on encrypted severs at this time.
+  if (FLAGS_encrypt_data_at_rest) {
+    GTEST_SKIP();
+  }
   // Create replicas and fill some data.
   const int kNumTserver = 3;
   InternalMiniClusterOptions opts;
@@ -8056,17 +8101,13 @@ TEST_F(ToolTest, TestRebuildTserverByLocalReplicaCopy) {
   NO_FATALS(StopMiniCluster());
 
   // Copy source tserver's all replicas from local filesystem.
-  string encryption_args = env_->IsEncryptionEnabled() ? GetEncryptionArgs() : "";
-  for (const auto& tablet_id : tablet_ids) {
-    string stdout;
-    NO_FATALS(RunActionStdoutString(Substitute("local_replica copy_from_local $0 $1 $2 $3",
-                                               tablet_id,
-                                               src_fs_paths_with_prefix,
-                                               dst_fs_paths_with_prefix,
-                                               encryption_args),
-                                    &stdout));
-    SCOPED_TRACE(stdout);
-  }
+  string stdout;
+  NO_FATALS(RunActionStdoutString(Substitute("local_replica copy_from_local $0 $1 $2",
+                                             JoinStrings(tablet_ids, ","),
+                                             src_fs_paths_with_prefix,
+                                             dst_fs_paths_with_prefix),
+                                  &stdout));
+  SCOPED_TRACE(stdout);
 
   // Replace the old data/wal dirs with the new ones.
   ASSERT_OK(Env::Default()->RenameFile(src_tserver_fs_root, src_tserver_fs_root + ".bak"));
@@ -8095,6 +8136,73 @@ TEST_F(ToolTest, TestRebuildTserverByLocalReplicaCopy) {
         RunActionStdoutStderrString(Substitute("cluster ksck $0", GetMasterAddrsStr()), &out, &err);
     ASSERT_TRUE(s.ok()) << s.ToString() << ", err:\n" << err << ", out:\n" << out;
   });
+}
+
+class SetFlagForAllTest :
+    public ToolTest,
+    public ::testing::WithParamInterface<bool> {
+};
+
+INSTANTIATE_TEST_SUITE_P(IsMaster, SetFlagForAllTest, ::testing::Bool());
+TEST_P(SetFlagForAllTest, TestSetFlagForAll) {
+  const auto is_master = GetParam();
+
+  ExternalMiniClusterOptions opts;
+  string role = "master";
+  if (is_master) {
+    opts.num_masters = 3;
+    role = "master";
+  } else {
+    opts.num_tablet_servers = 3;
+    role = "tserver";
+  }
+
+  NO_FATALS(StartExternalMiniCluster(std::move(opts)));
+  vector<string> master_addresses;
+  for (int i = 0; i < opts.num_masters; i++) {
+    master_addresses.emplace_back(cluster_->master(i)->bound_rpc_addr().ToString());
+  }
+  string str_master_addresses = JoinMapped(master_addresses, [](string addr){return addr;}, ",");
+  const string flag_key = "max_log_size";
+  const string flag_value = "10";
+  NO_FATALS(RunActionStdoutNone(
+      Substitute("$0 set_flag_for_all $1 $2 $3",
+          role, str_master_addresses, flag_key, flag_value)));
+
+  int hosts_num = is_master? opts.num_masters : opts.num_tablet_servers;
+  string out;
+  for (int i = 0; i < hosts_num; i++) {
+    if (is_master) {
+      NO_FATALS(RunActionStdoutString(
+          Substitute("$0 get_flags $1 --format=json", role,
+              cluster_->master(i)->bound_rpc_addr().ToString()),
+              &out));
+    } else {
+      NO_FATALS(RunActionStdoutString(
+          Substitute("$0 get_flags $1 --format=json", role,
+          cluster_->tablet_server(i)->bound_rpc_addr().ToString()),
+          &out));
+    }
+    rapidjson::Document doc;
+    doc.Parse<0>(out.c_str());
+    for (int i = 0; i < doc.Size(); i++) {
+      const rapidjson::Value& item = doc[i];
+      ASSERT_TRUE(item["flag"].IsString());
+      if (item["flag"].GetString() == flag_key) {
+        ASSERT_TRUE(item["value"].IsString());
+        ASSERT_TRUE(item["value"].GetString() == flag_value);
+        return;
+      }
+    }
+  }
+
+  // A test for setting a non-existing flag.
+  Status s = RunTool(
+      Substitute("$0 set_flag_for_all $2 test_flag test_value",
+          role, str_master_addresses),
+      nullptr, nullptr, nullptr, nullptr);
+  ASSERT_TRUE(s.IsRuntimeError());
+  ASSERT_STR_CONTAINS(s.ToString(), "set flag failed");
 }
 
 } // namespace tools

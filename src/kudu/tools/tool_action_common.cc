@@ -53,8 +53,10 @@
 #include "kudu/consensus/log.pb.h"
 #include "kudu/consensus/log_util.h"
 #include "kudu/consensus/opid.pb.h"
+#include "kudu/fs/fs.pb.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/ref_counted.h"
+#include "kudu/gutil/strings/escaping.h"
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/numbers.h"
 #include "kudu/gutil/strings/split.h"
@@ -133,8 +135,7 @@ DEFINE_string(memtracker_output, "table",
               "the memtracker hierarchy.");
 
 DEFINE_int32(num_threads, 2,
-             "Number of threads to run. Each thread runs its own "
-             "KuduSession.");
+             "Number of threads to run.");
 static bool ValidateNumThreads(const char* flag_name, int32_t flag_value) {
   if (flag_value <= 0) {
     LOG(ERROR) << strings::Substitute("'$0' flag should have a positive value",
@@ -160,6 +161,9 @@ DEFINE_bool(row_count_only, false,
             "an empty projection for the table");
 
 DECLARE_bool(show_values);
+
+DEFINE_string(instance_file, "",
+              "Path to the instance file containing the encrypted encryption key.");
 
 bool ValidateTimeoutSettings() {
   if (FLAGS_timeout_ms < FLAGS_negotiation_timeout_ms) {
@@ -237,6 +241,7 @@ using std::shared_ptr;
 using std::string;
 using std::unique_ptr;
 using std::vector;
+using strings::a2b_hex;
 using strings::Split;
 using strings::Substitute;
 
@@ -891,6 +896,25 @@ Status GetKuduToolAbsolutePathSafe(string* path) {
         "$0 binary not found at $1", kKuduCtlFileName, tool_abs_path));
   }
   *path = std::move(tool_abs_path);
+  return Status::OK();
+}
+
+Status SetServerKey() {
+  if (FLAGS_instance_file.empty()) {
+    return Status::OK();
+  }
+
+  InstanceMetadataPB instance;
+  RETURN_NOT_OK_PREPEND(pb_util::ReadPBContainerFromPath(Env::Default(), FLAGS_instance_file,
+                                                         &instance, pb_util::NOT_SENSITIVE),
+                        "Could not open instance file");
+
+  if (string key = instance.server_key();
+      !key.empty()) {
+    Env::Default()->SetEncryptionKey(reinterpret_cast<const uint8_t*>(a2b_hex(key).c_str()),
+                                     key.length() * 4);
+  }
+
   return Status::OK();
 }
 

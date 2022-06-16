@@ -34,13 +34,16 @@
 
 #include "kudu/client/client.h"
 #include "kudu/client/master_rpc.h"
+#include "kudu/fs/fs.pb.h"
 #include "kudu/rpc/rpc_header.pb.h"
+#include "kudu/server/key_provider.h"
 #if !defined(NO_CHRONY)
 #include "kudu/clock/test/mini_chronyd.h"
 #endif
 #include "kudu/common/wire_protocol.h"
 #include "kudu/common/wire_protocol.pb.h"
 #include "kudu/gutil/basictypes.h"
+#include "kudu/gutil/strings/escaping.h"
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/stringpiece.h"
 #include "kudu/gutil/strings/substitute.h"
@@ -54,6 +57,7 @@
 #include "kudu/rpc/sasl_common.h"
 #include "kudu/rpc/user_credentials.h"
 #include "kudu/security/test/mini_kdc.h"
+#include "kudu/server/default_key_provider.h"
 #include "kudu/server/server_base.pb.h"
 #include "kudu/server/server_base.proxy.h"
 #include "kudu/tablet/metadata.pb.h"
@@ -85,6 +89,7 @@ using kudu::master::MasterServiceProxy;
 using kudu::pb_util::SecureDebugString;
 using kudu::pb_util::SecureShortDebugString;
 using kudu::rpc::RpcController;
+using kudu::security::DefaultKeyProvider;
 using kudu::server::ServerStatusPB;
 using kudu::tserver::ListTabletsRequestPB;
 using kudu::tserver::ListTabletsResponsePB;
@@ -97,6 +102,7 @@ using std::string;
 using std::unique_ptr;
 using std::unordered_set;
 using std::vector;
+using strings::a2b_hex;
 using strings::Substitute;
 
 typedef ListTabletsResponsePB::StatusAndSchemaPB StatusAndSchemaPB;
@@ -151,6 +157,14 @@ ExternalMiniCluster::~ExternalMiniCluster() {
 
 Env* ExternalMiniCluster::env() const {
   return Env::Default();
+}
+
+Env* ExternalMiniCluster::ts_env(int ts_idx) const {
+  return tablet_server(ts_idx)->env();
+}
+
+Env* ExternalMiniCluster::master_env(int master_idx) const {
+  return master(master_idx)->env();
 }
 
 Status ExternalMiniCluster::DeduceBinRoot(std::string* ret) {
@@ -537,6 +551,7 @@ Status ExternalMiniCluster::StartMasters() {
     scoped_refptr<ExternalMaster> peer;
     RETURN_NOT_OK(CreateMaster(master_rpc_addrs, i, &peer));
     RETURN_NOT_OK_PREPEND(peer->Start(), Substitute("Unable to start Master at index $0", i));
+    RETURN_NOT_OK(peer->SetServerKey());
     masters_.emplace_back(std::move(peer));
   }
   return Status::OK();
@@ -599,6 +614,7 @@ Status ExternalMiniCluster::AddTabletServer() {
   }
 
   RETURN_NOT_OK(ts->Start());
+  RETURN_NOT_OK(ts->SetServerKey());
   tablet_servers_.push_back(ts);
   return Status::OK();
 }
@@ -1077,6 +1093,7 @@ Status ExternalMiniCluster::RemoveMaster(const HostPort& hp) {
 
 ExternalDaemon::ExternalDaemon(ExternalDaemonOptions opts)
     : opts_(std::move(opts)),
+      key_provider_(new DefaultKeyProvider()),
       parent_tid_(std::this_thread::get_id()) {
   CHECK(rpc_bind_address().Initialized());
 }
@@ -1253,6 +1270,24 @@ Status ExternalDaemon::StartProcess(const vector<string>& user_flags) {
 
   process_.swap(p);
   perf_record_process_.swap(perf_record);
+  return Status::OK();
+}
+
+Env* ExternalDaemon::env() const {
+  return Env::Default();
+}
+
+Status ExternalDaemon::SetServerKey() {
+  string path = JoinPathSegments(this->wal_dir(), "instance");;
+  LOG(INFO) << "Reading " << path;
+  InstanceMetadataPB instance;
+  RETURN_NOT_OK(pb_util::ReadPBContainerFromPath(env(), path, &instance, pb_util::NOT_SENSITIVE));
+  if (!instance.server_key().empty()) {
+    string key;
+    RETURN_NOT_OK(key_provider_->DecryptServerKey(instance.server_key(), &key));
+    LOG(INFO) << "Setting key " << key;
+    env()->SetEncryptionKey(reinterpret_cast<const uint8_t*>(a2b_hex(key).c_str()), key.size() * 4);
+  }
   return Status::OK();
 }
 
@@ -1527,7 +1562,8 @@ ScopedResumeExternalDaemon::~ScopedResumeExternalDaemon() {
 //------------------------------------------------------------
 
 ExternalMaster::ExternalMaster(ExternalDaemonOptions opts)
-    : ExternalDaemon(std::move(opts)) {
+    : ExternalDaemon(std::move(opts)),
+      env_(Env::NewEnv()) {
 }
 
 ExternalMaster::~ExternalMaster() {
@@ -1652,7 +1688,8 @@ vector<string> ExternalMaster::GetMasterFlags(const ExternalDaemonOptions& opts)
 ExternalTabletServer::ExternalTabletServer(ExternalDaemonOptions opts,
                                            vector<HostPort> master_addrs)
     : ExternalDaemon(std::move(opts)),
-      master_addrs_(std::move(master_addrs)) {
+      master_addrs_(std::move(master_addrs)),
+      env_(Env::NewEnv()) {
   DCHECK(!master_addrs_.empty());
 }
 

@@ -48,6 +48,9 @@ class Env;
 class NodeInstancePB;
 class Sockaddr;
 class Subprocess;
+namespace security {
+class KeyProvider;
+}  // namespace security
 
 namespace client {
 class KuduClient;
@@ -402,8 +405,16 @@ class ExternalMiniCluster : public MiniCluster {
   // Returns the UUID for the tablet server 'ts_idx'.
   virtual std::string UuidForTS(int ts_idx) const override;
 
-  // Returns the Env on which the cluster operates.
+  // Returns the Env on which the cluster operates. If encryption is enabled,
+  // the encryption key is incorrect. For reading/writing files, ts_env() and
+  // master_env() should be used instead.
   virtual Env* env() const override;
+
+  // Returns the Env on which a specific tablet server operates.
+  virtual Env* ts_env(int ts_idx) const override;
+
+  // Returns the Env on which a specific master operates.
+  virtual Env* master_env(int master_idx) const override;
 
   BindMode bind_mode() const override {
     return opts_.bind_mode;
@@ -540,6 +551,7 @@ class ExternalMiniCluster : public MiniCluster {
   std::unique_ptr<MiniKdc> kdc_;
   std::unique_ptr<hms::MiniHms> hms_;
   std::unique_ptr<ranger::MiniRanger> ranger_;
+  std::unique_ptr<security::KeyProvider> key_provider_;
 
   std::shared_ptr<rpc::Messenger> messenger_;
 
@@ -623,6 +635,8 @@ class ExternalDaemon : public RefCountedThreadSafe<ExternalDaemon> {
                         const std::string& principal_base,
                         const std::string& bind_host);
 
+  Status SetServerKey();
+
   // Sends a SIGSTOP signal to the daemon.
   Status Pause() WARN_UNUSED_RESULT;
 
@@ -676,6 +690,8 @@ class ExternalDaemon : public RefCountedThreadSafe<ExternalDaemon> {
   // Return the options used to create the daemon.
   ExternalDaemonOptions opts() const { return opts_; }
 
+  virtual Env* env() const;
+
   void SetRpcBindAddress(HostPort rpc_hostport) {
     DCHECK(!IsProcessAlive());
     bound_rpc_ = std::move(rpc_hostport);
@@ -727,6 +743,8 @@ class ExternalDaemon : public RefCountedThreadSafe<ExternalDaemon> {
 
   std::unique_ptr<server::ServerStatusPB> status_;
 
+  std::unique_ptr<security::KeyProvider> key_provider_;
+
   // These capture the daemons parameters and running ports and
   // are used to Restart() the daemon with the same parameters.
   HostPort bound_rpc_;
@@ -767,6 +785,8 @@ class ExternalMaster : public ExternalDaemon {
   // Requires that it has previously been shutdown.
   virtual Status Restart() override WARN_UNUSED_RESULT;
 
+  Env* env() const override { return env_.get(); }
+
   // Blocks until the master's catalog manager is initialized and responding to
   // RPCs. If 'wait_mode' is WAIT_FOR_LEADERSHIP, will further block until the
   // master has been elected leader.
@@ -791,6 +811,7 @@ class ExternalMaster : public ExternalDaemon {
   // addresses in case of restart.
   static std::vector<std::string> GetCommonFlags(const HostPort& rpc_bind_addr,
                                                  const HostPort& http_addr = HostPort());
+  const std::unique_ptr<Env> env_;
   virtual ~ExternalMaster();
 };
 
@@ -805,8 +826,10 @@ class ExternalTabletServer : public ExternalDaemon {
   // Requires that it has previously been shutdown.
   virtual Status Restart() override WARN_UNUSED_RESULT;
 
+  Env* env() const override { return env_.get(); }
  private:
   const std::vector<HostPort> master_addrs_;
+  const std::unique_ptr<Env> env_;
 
   friend class RefCountedThreadSafe<ExternalTabletServer>;
   virtual ~ExternalTabletServer();

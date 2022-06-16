@@ -234,6 +234,7 @@ DEFINE_int32(max_create_tablets_per_ts, 60,
              "The number of tablet replicas per TS that can be requested for a "
              "new table. If 0, no limit is enforced.");
 TAG_FLAG(max_create_tablets_per_ts, advanced);
+TAG_FLAG(max_create_tablets_per_ts, runtime);
 
 DEFINE_int32(master_failover_catchup_timeout_ms, 30 * 1000, // 30 sec
              "Amount of time to give a newly-elected leader master to load"
@@ -396,6 +397,13 @@ DEFINE_bool(enable_chunked_tablet_writes, true,
             "--rpc_max_message_size.");
 TAG_FLAG(enable_chunked_tablet_writes, experimental);
 TAG_FLAG(enable_chunked_tablet_writes, runtime);
+
+DEFINE_bool(require_new_spec_for_custom_hash_schema_range_bound, false,
+            "Whether to require the client to use newer signature to specify "
+            "range bounds when working with a table having custom hash schema "
+            "per range");
+TAG_FLAG(require_new_spec_for_custom_hash_schema_range_bound, experimental);
+TAG_FLAG(require_new_spec_for_custom_hash_schema_range_bound, runtime);
 
 DECLARE_bool(raft_prepare_replacement_before_eviction);
 DECLARE_int64(tsk_rotation_seconds);
@@ -807,7 +815,7 @@ void CatalogManagerBgTasks::Run() {
           catalog_manager_->ExtractDeletedTablesAndTablets(&deleted_tables, &deleted_tablets);
           Status s = Status::OK();
           // Clean up metadata for deleted tablets first and then clean up metadata for deleted
-          // tables. This is the reverse of the order in which we load them. So for any remaining
+          // tables. This is the reverse of the order in which we load them. So for any remaining
           // tablet, the metadata of the table to which it belongs must exist.
           const time_t now = time(nullptr);
           if (!deleted_tablets.empty()) {
@@ -1866,7 +1874,7 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
       PartitionSchema::FromPB(req.partition_schema(), schema, &partition_schema),
       resp, MasterErrorPB::INVALID_SCHEMA));
 
-  // Decode split rows.
+  // Decode split rows and range bounds.
   vector<KuduPartialRow> split_rows;
   vector<pair<KuduPartialRow, KuduPartialRow>> range_bounds;
 
@@ -1875,7 +1883,7 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
   vector<DecodedRowOperation> ops;
   RETURN_NOT_OK(decoder.DecodeOperations<DecoderMode::SPLIT_ROWS>(&ops));
 
-  for (int i = 0; i < ops.size(); i++) {
+  for (size_t i = 0; i < ops.size(); ++i) {
     const DecodedRowOperation& op = ops[i];
     switch (op.type) {
       case RowOperationsPB::SPLIT_ROW: {
@@ -1909,38 +1917,36 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
     }
   }
 
-  // TODO(aserbin): make sure range boundaries in
-  //                req.partition_schema().custom_hash_schema_ranges()
-  //                correspond to range_bounds?
-  vector<PartitionSchema::HashSchema> range_hash_schemas;
-  if (FLAGS_enable_per_range_hash_schemas) {
-    // TODO(aserbin): the signature of CreatePartitions() require the
-    //                'range_hash_schemas' parameters: update its signature
-    //                to remove the extra parameter and rely on its
-    //                'ranges_with_hash_schemas_' member field; the path in
-    //                CatalogManager::ApplyAlterPartitioningSteps() involving
-    //                CreatePartitions() should be updated correspondingly.
-    const auto& ps = req.partition_schema();
-    for (int i = 0; i < ps.custom_hash_schema_ranges_size(); i++) {
-      PartitionSchema::HashSchema hash_schema;
-      RETURN_NOT_OK(PartitionSchema::ExtractHashSchemaFromPB(
-          schema, ps.custom_hash_schema_ranges(i).hash_schema(), &hash_schema));
-      range_hash_schemas.emplace_back(std::move(hash_schema));
+  vector<Partition> partitions;
+  if (const auto& ps = req.partition_schema();
+      FLAGS_enable_per_range_hash_schemas && !ps.custom_hash_schema_ranges().empty()) {
+    if (!split_rows.empty()) {
+      return Status::InvalidArgument(
+          "both split rows and custom hash schema ranges must not be "
+          "populated at the same time");
     }
+    if (!range_bounds.empty()) {
+      return Status::InvalidArgument(
+          "both range bounds and custom hash schema ranges must not be "
+          "populated at the same time");
+    }
+    // Create partitions based on specified ranges with custom hash schemas.
+    RETURN_NOT_OK(partition_schema.CreatePartitions(schema, &partitions));
+  } else {
+    // Create partitions based on specified partition schema and split rows.
+    RETURN_NOT_OK(partition_schema.CreatePartitions(
+        split_rows, range_bounds, schema, &partitions));
   }
 
-  // Create partitions based on specified partition schema and split rows.
-  vector<Partition> partitions;
-  RETURN_NOT_OK(partition_schema.CreatePartitions(
-      split_rows, range_bounds, range_hash_schemas, schema, &partitions));
-
   // Check the restriction on the same number of hash dimensions across all the
-  // ranges.
+  // ranges. Also, check that the table-wide hash schema has the same number
+  // of hash dimensions as all the partitions with custom hash schemas.
   //
   // TODO(aserbin): remove the restriction once the rest of the code is ready
-  //                to handle range partitions with arbitrary hash schemas
+  //                to handle range partitions with arbitrary number of hash
+  //                dimensions in hash schemas
   CHECK(!partitions.empty());
-  const auto hash_dimensions_num = partitions.begin()->hash_buckets().size();
+  const auto hash_dimensions_num = partition_schema.hash_schema().size();
   for (const auto& p : partitions) {
     if (p.hash_buckets().size() != hash_dimensions_num) {
       return Status::NotSupported(
@@ -2512,10 +2518,11 @@ Status CatalogManager::DeleteTable(const DeleteTableRequestPB& req,
   return Status::OK();
 }
 
-Status CatalogManager::ApplyAlterSchemaSteps(const SysTablesEntryPB& current_pb,
-                                             vector<AlterTableRequestPB::Step> steps,
-                                             Schema* new_schema,
-                                             ColumnId* next_col_id) {
+Status CatalogManager::ApplyAlterSchemaSteps(
+    const SysTablesEntryPB& current_pb,
+    const vector<AlterTableRequestPB::Step>& steps,
+    Schema* new_schema,
+    ColumnId* next_col_id) {
   const SchemaPB& current_schema_pb = current_pb.schema();
   Schema cur_schema;
   RETURN_NOT_OK(SchemaFromPB(current_schema_pb, &cur_schema));
@@ -2595,21 +2602,20 @@ Status CatalogManager::ApplyAlterSchemaSteps(const SysTablesEntryPB& current_pb,
 }
 
 Status CatalogManager::ApplyAlterPartitioningSteps(
-    const TableMetadataLock& l,
     const scoped_refptr<TableInfo>& table,
     const Schema& client_schema,
-    vector<AlterTableRequestPB::Step> steps,
+    const vector<AlterTableRequestPB::Step>& steps,
+    TableMetadataLock* l,
     vector<scoped_refptr<TabletInfo>>* tablets_to_add,
     vector<scoped_refptr<TabletInfo>>* tablets_to_drop) {
 
   // Get the table's schema as it's known to the catalog manager.
   Schema schema;
-  RETURN_NOT_OK(SchemaFromPB(l.data().pb.schema(), &schema));
+  RETURN_NOT_OK(SchemaFromPB(l->data().pb.schema(), &schema));
   // Build current PartitionSchema for the table.
   PartitionSchema partition_schema;
   RETURN_NOT_OK(PartitionSchema::FromPB(
-      l.data().pb.partition_schema(), schema, &partition_schema));
-
+      l->data().pb.partition_schema(), schema, &partition_schema));
   TableInfo::TabletInfoMap existing_tablets = table->tablet_map();
   TableInfo::TabletInfoMap new_tablets;
   auto abort_mutations = MakeScopedCleanup([&new_tablets]() {
@@ -2618,18 +2624,17 @@ Status CatalogManager::ApplyAlterPartitioningSteps(
     }
   });
 
+  vector<PartitionSchema::HashSchema> range_hash_schemas;
   for (const auto& step : steps) {
+    CHECK(step.type() == AlterTableRequestPB::ADD_RANGE_PARTITION ||
+          step.type() == AlterTableRequestPB::DROP_RANGE_PARTITION);
+    const auto& range_bounds =
+        step.type() == AlterTableRequestPB::ADD_RANGE_PARTITION
+        ? step.add_range_partition().range_bounds()
+        : step.drop_range_partition().range_bounds();
+    RowOperationsPBDecoder decoder(&range_bounds, &client_schema, &schema, nullptr);
     vector<DecodedRowOperation> ops;
-    if (step.type() == AlterTableRequestPB::ADD_RANGE_PARTITION) {
-      RowOperationsPBDecoder decoder(&step.add_range_partition().range_bounds(),
-                                     &client_schema, &schema, nullptr);
-      RETURN_NOT_OK(decoder.DecodeOperations<DecoderMode::SPLIT_ROWS>(&ops));
-    } else {
-      CHECK_EQ(step.type(), AlterTableRequestPB::DROP_RANGE_PARTITION);
-      RowOperationsPBDecoder decoder(&step.drop_range_partition().range_bounds(),
-                                     &client_schema, &schema, nullptr);
-      RETURN_NOT_OK(decoder.DecodeOperations<DecoderMode::SPLIT_ROWS>(&ops));
-    }
+    RETURN_NOT_OK(decoder.DecodeOperations<DecoderMode::SPLIT_ROWS>(&ops));
 
     if (ops.size() != 2) {
       return Status::InvalidArgument(
@@ -2656,8 +2661,43 @@ Status CatalogManager::ApplyAlterPartitioningSteps(
     }
 
     vector<Partition> partitions;
-    RETURN_NOT_OK(partition_schema.CreatePartitions(
-        {}, {{ *ops[0].split_row, *ops[1].split_row }}, {}, schema, &partitions));
+    const pair<KuduPartialRow, KuduPartialRow> range_bound =
+        { *ops[0].split_row, *ops[1].split_row };
+    if (step.type() == AlterTableRequestPB::ADD_RANGE_PARTITION &&
+        FLAGS_enable_per_range_hash_schemas &&
+        step.add_range_partition().custom_hash_schema_size() > 0) {
+      const Schema schema = client_schema.CopyWithColumnIds();
+      PartitionSchema::HashSchema hash_schema;
+      RETURN_NOT_OK(PartitionSchema::ExtractHashSchemaFromPB(
+          schema, step.add_range_partition().custom_hash_schema(), &hash_schema));
+      if (partition_schema.hash_schema().size() != hash_schema.size()) {
+        return Status::NotSupported(
+            "varying number of hash dimensions per range is not yet supported");
+      }
+      RETURN_NOT_OK(partition_schema.CreatePartitionsForRange(
+          range_bound, hash_schema, schema, &partitions));
+
+      // Add information on the new range with custom hash schema into the
+      // PartitionSchema for the table stored in the system catalog.
+      auto* p = l->mutable_data()->pb.mutable_partition_schema();
+      auto* range = p->add_custom_hash_schema_ranges();
+      RowOperationsPBEncoder encoder(range->mutable_range_bounds());
+      encoder.Add(RowOperationsPB::RANGE_LOWER_BOUND, *ops[0].split_row);
+      encoder.Add(RowOperationsPB::RANGE_UPPER_BOUND, *ops[1].split_row);
+      for (const auto& hash_dimension : hash_schema) {
+        auto* hash_dimension_pb = range->add_hash_schema();
+        hash_dimension_pb->set_num_buckets(hash_dimension.num_buckets);
+        hash_dimension_pb->set_seed(hash_dimension.seed);
+        auto* columns = hash_dimension_pb->add_columns();
+        for (const auto& column_id : hash_dimension.column_ids) {
+          columns->set_id(column_id);
+        }
+      }
+    } else {
+      RETURN_NOT_OK(partition_schema.CreatePartitions(
+          {}, { range_bound }, schema, &partitions));
+    }
+
     switch (step.type()) {
       case AlterTableRequestPB::ADD_RANGE_PARTITION: {
         for (const Partition& partition : partitions) {
@@ -3180,11 +3220,11 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
     TRACE("Apply alter partitioning");
     Schema client_schema;
     RETURN_NOT_OK(SetupError(SchemaFromPB(req.schema(), &client_schema),
-          resp, MasterErrorPB::UNKNOWN_ERROR));
-    RETURN_NOT_OK(SetupError(
-          ApplyAlterPartitioningSteps(l, table, client_schema, alter_partitioning_steps,
-            &tablets_to_add, &tablets_to_drop),
-          resp, MasterErrorPB::UNKNOWN_ERROR));
+        resp, MasterErrorPB::UNKNOWN_ERROR));
+    RETURN_NOT_OK(SetupError(ApplyAlterPartitioningSteps(
+        table, client_schema, alter_partitioning_steps, &l,
+        &tablets_to_add, &tablets_to_drop),
+                             resp, MasterErrorPB::UNKNOWN_ERROR));
   }
 
   // 8. Alter table's replication factor.
@@ -3837,14 +3877,17 @@ class PickLeaderReplica : public TSPicker {
 //
 // The target tablet server is refreshed before each RPC by consulting the provided
 // TSPicker implementation.
+// Each created RetryingTSRpcTask should be added to TableInfo::pending_tasks_ by
+// calling TableInfo::AddTask(), so 'table' must remain valid for the lifetime of
+// this class.
 class RetryingTSRpcTask : public MonitoredTask {
  public:
-  RetryingTSRpcTask(Master *master,
+  RetryingTSRpcTask(Master* master,
                     unique_ptr<TSPicker> replica_picker,
-                    scoped_refptr<TableInfo> table)
+                    TableInfo* table)
     : master_(master),
       replica_picker_(std::move(replica_picker)),
-      table_(std::move(table)),
+      table_(table),
       start_ts_(MonoTime::Now()),
       deadline_(start_ts_ + MonoDelta::FromMilliseconds(FLAGS_unresponsive_ts_rpc_timeout_ms)),
       attempt_(0),
@@ -3868,7 +3911,7 @@ class RetryingTSRpcTask : public MonitoredTask {
 
   MonoTime start_timestamp() const override { return start_ts_; }
   MonoTime completion_timestamp() const override { return end_ts_; }
-  const scoped_refptr<TableInfo>& table() const { return table_ ; }
+  TableInfo* table() const { return table_; }
 
  protected:
   // Send an RPC request and register a callback.
@@ -3911,7 +3954,8 @@ class RetryingTSRpcTask : public MonitoredTask {
 
   Master * const master_;
   const unique_ptr<TSPicker> replica_picker_;
-  const scoped_refptr<TableInfo> table_;
+  // RetryingTSRpcTask is owned by 'TableInfo', so the backpointer should be raw.
+  TableInfo* table_;
 
   MonoTime start_ts_;
   MonoTime end_ts_;
@@ -4083,7 +4127,7 @@ class RetrySpecificTSRpcTask : public RetryingTSRpcTask {
  public:
   RetrySpecificTSRpcTask(Master* master,
                          const string& permanent_uuid,
-                         const scoped_refptr<TableInfo>& table)
+                         TableInfo* table)
     : RetryingTSRpcTask(master,
                         unique_ptr<TSPicker>(new PickSpecificUUID(permanent_uuid)),
                         table),
@@ -4105,7 +4149,7 @@ class AsyncCreateReplica : public RetrySpecificTSRpcTask {
                      const string& permanent_uuid,
                      const scoped_refptr<TabletInfo>& tablet,
                      const TabletMetadataLock& tablet_lock)
-    : RetrySpecificTSRpcTask(master, permanent_uuid, tablet->table()),
+    : RetrySpecificTSRpcTask(master, permanent_uuid, tablet->table().get()),
       tablet_id_(tablet->id()) {
     deadline_ = start_ts_ + MonoDelta::FromMilliseconds(FLAGS_tablet_creation_timeout_ms);
 
@@ -4171,17 +4215,17 @@ class AsyncCreateReplica : public RetrySpecificTSRpcTask {
 // Send a DeleteTablet() RPC request.
 class AsyncDeleteReplica : public RetrySpecificTSRpcTask {
  public:
-  AsyncDeleteReplica(
-      Master* master, const string& permanent_uuid,
-      const scoped_refptr<TableInfo>& table, string tablet_id,
-      TabletDataState delete_type,
-      optional<int64_t> cas_config_opid_index_less_or_equal,
-      string reason)
+  AsyncDeleteReplica(Master* master,
+                     const string& permanent_uuid,
+                     TableInfo* table,
+                     string tablet_id,
+                     TabletDataState delete_type,
+                     optional<int64_t> cas_config_opid_index_less_or_equal,
+                     string reason)
       : RetrySpecificTSRpcTask(master, permanent_uuid, table),
         tablet_id_(std::move(tablet_id)),
         delete_type_(delete_type),
-        cas_config_opid_index_less_or_equal_(
-            std::move(cas_config_opid_index_less_or_equal)),
+        cas_config_opid_index_less_or_equal_(std::move(cas_config_opid_index_less_or_equal)),
         reason_(std::move(reason)) {}
 
   string type_name() const override {
@@ -4286,7 +4330,7 @@ class AsyncAlterTable : public RetryingTSRpcTask {
                   scoped_refptr<TabletInfo> tablet)
     : RetryingTSRpcTask(master,
                         unique_ptr<TSPicker>(new PickLeaderReplica(tablet)),
-                        tablet->table()),
+                        tablet->table().get()),
       tablet_(std::move(tablet)) {
   }
 
@@ -4386,7 +4430,7 @@ AsyncChangeConfigTask::AsyncChangeConfigTask(Master* master,
                                              consensus::ChangeConfigType change_config_type)
     : RetryingTSRpcTask(master,
                         unique_ptr<TSPicker>(new PickLeaderReplica(tablet)),
-                        tablet->table()),
+                        tablet->table().get()),
       tablet_(std::move(tablet)),
       cstate_(std::move(cstate)),
       change_config_type_(change_config_type) {
@@ -4751,7 +4795,7 @@ Status CatalogManager::ProcessTabletReport(
       // TODO(unknown): Cancel tablet creation, instead of deleting, in cases
       // where that might be possible (tablet creation timeout & replacement).
       rpcs.emplace_back(new AsyncDeleteReplica(
-          master_, ts_desc->permanent_uuid(), table, tablet_id,
+          master_, ts_desc->permanent_uuid(), table.get(), tablet_id,
           TABLET_DATA_DELETED, none, msg));
       continue;
     }
@@ -4778,7 +4822,7 @@ Status CatalogManager::ProcessTabletReport(
           "Replica has no consensus available" :
           Substitute("Replica with old config index $0", report_opid_index);
       rpcs.emplace_back(new AsyncDeleteReplica(
-          master_, ts_desc->permanent_uuid(), table, tablet_id,
+          master_, ts_desc->permanent_uuid(), table.get(), tablet_id,
           TABLET_DATA_TOMBSTONED, prev_opid_index,
           Substitute("$0 (current committed config index is $1)",
                      delete_msg, prev_opid_index)));
@@ -4901,7 +4945,7 @@ Status CatalogManager::ProcessTabletReport(
             const string& peer_uuid = p.permanent_uuid();
             if (!ContainsKey(current_member_uuids, peer_uuid)) {
               rpcs.emplace_back(new AsyncDeleteReplica(
-                  master_, peer_uuid, table, tablet_id,
+                  master_, peer_uuid, table.get(), tablet_id,
                   TABLET_DATA_TOMBSTONED, prev_cstate.committed_config().opid_index(),
                   Substitute("TS $0 not found in new config with opid_index $1",
                              peer_uuid, cstate.committed_config().opid_index())));
@@ -5158,7 +5202,7 @@ void CatalogManager::SendDeleteTabletRequest(const scoped_refptr<TabletInfo>& ta
       << " replicas of tablet " << tablet->id();
   for (const auto& peer : cstate.committed_config().peers()) {
     scoped_refptr<AsyncDeleteReplica> task = new AsyncDeleteReplica(
-        master_, peer.permanent_uuid(), tablet->table(), tablet->id(),
+        master_, peer.permanent_uuid(), tablet->table().get(), tablet->id(),
         TABLET_DATA_DELETED, none, deletion_msg);
     tablet->table()->AddTask(tablet->id(), task);
     WARN_NOT_OK(task->Run(), Substitute(
@@ -6505,6 +6549,9 @@ void PersistentTabletInfo::set_state(SysTabletsEntryPB::State state, const strin
 TableInfo::TableInfo(string table_id) : table_id_(std::move(table_id)) {}
 
 TableInfo::~TableInfo() {
+  // Abort and wait for all pending tasks completed.
+  AbortTasks();
+  WaitTasksCompletion();
 }
 
 string TableInfo::ToString() const {
@@ -6557,6 +6604,11 @@ Status TableInfo::GetTabletsInRange(
     const GetTableLocationsRequestPB* req,
     vector<scoped_refptr<TabletInfo>>* ret) const {
 
+  static constexpr const char* const kErrRangeNewSpec =
+      "$0: for a table with custom per-range hash schemas the range must "
+      "be specified using partition_key_range field, not "
+      "partition_key_{start,end} fields";
+
   size_t hash_dimensions_num = 0;
   bool has_custom_hash_schemas = false;
   {
@@ -6579,11 +6631,9 @@ Status TableInfo::GetTabletsInRange(
       has_key_start = true;
     }
   } else if (req->has_partition_key_start()) {
-    if (has_custom_hash_schemas) {
-      return Status::InvalidArgument(Substitute(
-          "$0: for a table with custom per-range hash schemas the range must "
-          "be specified using partition_key_range field, not "
-          "partition_key_{start,end} fields", ToString()));
+    if (has_custom_hash_schemas &&
+        FLAGS_require_new_spec_for_custom_hash_schema_range_bound) {
+      return Status::InvalidArgument(Substitute(kErrRangeNewSpec, ToString()));
     }
     partition_key_start = Partition::StringToPartitionKey(
         req->partition_key_start(), hash_dimensions_num);
@@ -6599,11 +6649,9 @@ Status TableInfo::GetTabletsInRange(
       has_key_end = true;
     }
   } else if (req->has_partition_key_end()) {
-    if (has_custom_hash_schemas) {
-      return Status::InvalidArgument(Substitute(
-          "$0: for a table with custom per-range hash schemas the range must "
-          "be specified using partition_key_range field, not "
-          "partition_key_{start,end} fields", ToString()));
+    if (has_custom_hash_schemas &&
+        FLAGS_require_new_spec_for_custom_hash_schema_range_bound) {
+      return Status::InvalidArgument(Substitute(kErrRangeNewSpec, ToString()));
     }
     partition_key_end = Partition::StringToPartitionKey(
         req->partition_key_end(), hash_dimensions_num);
