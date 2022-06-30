@@ -51,20 +51,21 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <ostream>
 #include <set>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
-#include <boost/optional/optional.hpp>
-#include <boost/optional/optional_io.hpp> // IWYU pragma: keep
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <google/protobuf/arena.h>
 #include <google/protobuf/stubs/common.h>
+#include <google/protobuf/stubs/port.h>
 
 #include "kudu/cfile/type_encodings.h"
 #include "kudu/common/common.pb.h"
@@ -413,8 +414,6 @@ METRIC_DEFINE_entity(table);
 
 using base::subtle::NoBarrier_CompareAndSwap;
 using base::subtle::NoBarrier_Load;
-using boost::none;
-using boost::optional;
 using google::protobuf::Map;
 using kudu::cfile::TypeEncodingInfo;
 using kudu::consensus::ConsensusServiceProxy;
@@ -444,6 +443,9 @@ using kudu::tablet::TabletDataState;
 using kudu::tablet::TabletReplica;
 using kudu::tablet::TabletStatePB;
 using kudu::tserver::TabletServerErrorPB;
+using std::make_optional;
+using std::nullopt;
+using std::optional;
 using std::pair;
 using std::set;
 using std::shared_ptr;
@@ -1747,7 +1749,7 @@ Status ValidateClientSchema(const optional<string>& name,
                             const optional<string>& comment,
                             const Schema& schema) {
   if (name) {
-    RETURN_NOT_OK_PREPEND(ValidateIdentifier(name.get()), "invalid table name");
+    RETURN_NOT_OK_PREPEND(ValidateIdentifier(*name), "invalid table name");
   }
   if (owner) {
     RETURN_NOT_OK_PREPEND(ValidateOwner(*owner), "invalid owner name");
@@ -1811,9 +1813,9 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
   LOG(INFO) << Substitute("Servicing CreateTable request from $0:\n$1",
                           RequestorString(rpc), SecureDebugString(req));
 
-  optional<const string&> user;
+  optional<const string> user;
   if (rpc) {
-    user = rpc->remote_user().username();
+    user.emplace(rpc->remote_user().username());
   }
   // Default the owner if it isn't set.
   if (user && !req.has_owner()) {
@@ -1835,9 +1837,9 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
   if (is_user_table) {
     // a. Validate the user request.
     if (rpc) {
-      DCHECK_NE(boost::none, user);
+      DCHECK(user.has_value());
       RETURN_NOT_OK(SetupError(
-          authz_provider_->AuthorizeCreateTable(normalized_table_name, user.get(), req.owner()),
+          authz_provider_->AuthorizeCreateTable(normalized_table_name, *user, req.owner()),
           resp, MasterErrorPB::NOT_AUTHORIZED));
     }
 
@@ -1870,8 +1872,12 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
   // the default partition schema (no hash bucket components and a range
   // partitioned on the primary key columns) will be used.
   PartitionSchema partition_schema;
+  PartitionSchema::RangesWithHashSchemas ranges_with_hash_schemas;
   RETURN_NOT_OK(SetupError(
-      PartitionSchema::FromPB(req.partition_schema(), schema, &partition_schema),
+      PartitionSchema::FromPB(req.partition_schema(),
+                              schema,
+                              &partition_schema,
+                              &ranges_with_hash_schemas),
       resp, MasterErrorPB::INVALID_SCHEMA));
 
   // Decode split rows and range bounds.
@@ -1930,8 +1936,9 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
           "both range bounds and custom hash schema ranges must not be "
           "populated at the same time");
     }
-    // Create partitions based on specified ranges with custom hash schemas.
-    RETURN_NOT_OK(partition_schema.CreatePartitions(schema, &partitions));
+    // Create partitions based on the specified ranges and their hash schemas.
+    RETURN_NOT_OK(partition_schema.CreatePartitions(
+        ranges_with_hash_schemas, schema, &partitions));
   } else {
     // Create partitions based on specified partition schema and split rows.
     RETURN_NOT_OK(partition_schema.CreatePartitions(
@@ -2011,7 +2018,7 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
     }
   });
   const optional<string> dimension_label =
-      req.has_dimension_label() ? boost::make_optional(req.dimension_label()) : none;
+      req.has_dimension_label() ? make_optional(req.dimension_label()) : nullopt;
   for (const Partition& partition : partitions) {
     PartitionPB partition_pb;
     partition.ToPB(&partition_pb);
@@ -2124,7 +2131,7 @@ Status CatalogManager::CreateTable(const CreateTableRequestPB* orig_req,
 
 Status CatalogManager::IsCreateTableDone(const IsCreateTableDoneRequestPB* req,
                                          IsCreateTableDoneResponsePB* resp,
-                                         optional<const string&> user) {
+                                         const optional<string>& user) {
   leader_lock_.AssertAcquiredForReading();
 
   // 1. Lookup the table, verify if it exists, and then check that
@@ -2136,8 +2143,8 @@ Status CatalogManager::IsCreateTableDone(const IsCreateTableDoneRequestPB* req,
                                                                  username == owner),
                       resp, MasterErrorPB::NOT_AUTHORIZED);
   };
-  RETURN_NOT_OK(FindLockAndAuthorizeTable(*req, resp, LockMode::READ, authz_func, user,
-                                          &table, &l));
+  RETURN_NOT_OK(FindLockAndAuthorizeTable(
+      *req, resp, LockMode::READ, authz_func, user, &table, &l));
   RETURN_NOT_OK(CheckIfTableDeletedOrNotRunning(&l, resp));
 
   // 2. Verify if the create is in-progress
@@ -2219,7 +2226,7 @@ Status CatalogManager::FindLockAndAuthorizeTable(
     RespClass* response,
     LockMode lock_mode,
     F authz_func,
-    optional<const string&> user,
+    const optional<string>& user,
     scoped_refptr<TableInfo>* table_info,
     TableMetadataLock* table_lock) {
   TRACE("Looking up, locking, and authorizing table");
@@ -2342,9 +2349,9 @@ Status CatalogManager::DeleteTableRpc(const DeleteTableRequestPB& req,
 
   leader_lock_.AssertAcquiredForReading();
 
-  optional<const string&> user;
+  optional<string> user;
   if (rpc) {
-    user = rpc->remote_user().username();
+    user.emplace(rpc->remote_user().username());
   }
 
   // If the HMS integration is enabled and the table should be deleted in the HMS,
@@ -2367,8 +2374,8 @@ Status CatalogManager::DeleteTableRpc(const DeleteTableRequestPB& req,
                                                             username == owner),
                         resp, MasterErrorPB::NOT_AUTHORIZED);
     };
-    RETURN_NOT_OK(FindLockAndAuthorizeTable(req, resp, LockMode::READ, authz_func, user,
-                                            &table, &l));
+    RETURN_NOT_OK(FindLockAndAuthorizeTable(
+        req, resp, LockMode::READ, authz_func, user, &table, &l));
     if (l.data().is_deleted()) {
       return SetupError(Status::NotFound("the table was deleted", l.data().pb.state_msg()),
           resp, MasterErrorPB::TABLE_NOT_FOUND);
@@ -2395,7 +2402,7 @@ Status CatalogManager::DeleteTableRpc(const DeleteTableRequestPB& req,
 
   // If the HMS integration isn't enabled or the deletion should only happen in Kudu,
   // then delete the table directly from the Kudu catalog.
-  return DeleteTable(req, resp, /*hms_notification_log_event_id=*/none, user);
+  return DeleteTable(req, resp, /*hms_notification_log_event_id=*/nullopt, user);
 }
 
 Status CatalogManager::DeleteTableHms(const string& table_name,
@@ -2414,7 +2421,7 @@ Status CatalogManager::DeleteTableHms(const string& table_name,
   // Use empty user to skip the authorization validation since the operation
   // originates from catalog manager. Moreover, this avoids duplicate effort,
   // because we already perform authorization before making any changes to the HMS.
-  RETURN_NOT_OK(DeleteTable(req, &resp, notification_log_event_id, /*user=*/none));
+  RETURN_NOT_OK(DeleteTable(req, &resp, notification_log_event_id, /*user=*/nullopt));
 
   // Update the cached HMS notification log event ID, if it changed.
   DCHECK_GT(notification_log_event_id, hms_notification_log_event_id_);
@@ -2426,7 +2433,7 @@ Status CatalogManager::DeleteTableHms(const string& table_name,
 Status CatalogManager::DeleteTable(const DeleteTableRequestPB& req,
                                    DeleteTableResponsePB* resp,
                                    optional<int64_t> hms_notification_log_event_id,
-                                   optional<const string&> user) {
+                                   const optional<string>& user) {
   leader_lock_.AssertAcquiredForReading();
 
   // 1. Look up the table, lock it, and then check that the user is authorized
@@ -2437,8 +2444,8 @@ Status CatalogManager::DeleteTable(const DeleteTableRequestPB& req,
     return SetupError(authz_provider_->AuthorizeDropTable(table_name, username, username == owner),
                       resp, MasterErrorPB::NOT_AUTHORIZED);
   };
-  RETURN_NOT_OK(FindLockAndAuthorizeTable(req, resp, LockMode::WRITE, authz_func, user,
-                                          &table, &l));
+  RETURN_NOT_OK(FindLockAndAuthorizeTable(
+      req, resp, LockMode::WRITE, authz_func, user, &table, &l));
   if (l.data().is_deleted()) {
     return SetupError(Status::NotFound("the table was deleted", l.data().pb.state_msg()),
         resp, MasterErrorPB::TABLE_NOT_FOUND);
@@ -2547,7 +2554,7 @@ Status CatalogManager::ApplyAlterSchemaSteps(
         RETURN_NOT_OK(ProcessColumnPBDefaults(&new_col_pb));
 
         // Can't accept a NOT NULL column without a default.
-        boost::optional<ColumnSchema> new_col;
+        optional<ColumnSchema> new_col;
         RETURN_NOT_OK(ColumnSchemaFromPB(new_col_pb, &new_col));
         if (!new_col->is_nullable() && !new_col->has_read_default()) {
           return Status::InvalidArgument(
@@ -2607,7 +2614,12 @@ Status CatalogManager::ApplyAlterPartitioningSteps(
     const vector<AlterTableRequestPB::Step>& steps,
     TableMetadataLock* l,
     vector<scoped_refptr<TabletInfo>>* tablets_to_add,
-    vector<scoped_refptr<TabletInfo>>* tablets_to_drop) {
+    vector<scoped_refptr<TabletInfo>>* tablets_to_drop,
+    bool* partition_schema_updated) {
+  DCHECK(l);
+  DCHECK(tablets_to_add);
+  DCHECK(tablets_to_drop);
+  DCHECK(partition_schema_updated);
 
   // Get the table's schema as it's known to the catalog manager.
   Schema schema;
@@ -2625,6 +2637,7 @@ Status CatalogManager::ApplyAlterPartitioningSteps(
   });
 
   vector<PartitionSchema::HashSchema> range_hash_schemas;
+  size_t partition_schema_updates = 0;
   for (const auto& step : steps) {
     CHECK(step.type() == AlterTableRequestPB::ADD_RANGE_PARTITION ||
           step.type() == AlterTableRequestPB::DROP_RANGE_PARTITION);
@@ -2663,39 +2676,64 @@ Status CatalogManager::ApplyAlterPartitioningSteps(
     vector<Partition> partitions;
     const pair<KuduPartialRow, KuduPartialRow> range_bound =
         { *ops[0].split_row, *ops[1].split_row };
-    if (step.type() == AlterTableRequestPB::ADD_RANGE_PARTITION &&
-        FLAGS_enable_per_range_hash_schemas &&
-        step.add_range_partition().custom_hash_schema_size() > 0) {
-      const Schema schema = client_schema.CopyWithColumnIds();
-      PartitionSchema::HashSchema hash_schema;
-      RETURN_NOT_OK(PartitionSchema::ExtractHashSchemaFromPB(
-          schema, step.add_range_partition().custom_hash_schema(), &hash_schema));
-      if (partition_schema.hash_schema().size() != hash_schema.size()) {
-        return Status::NotSupported(
-            "varying number of hash dimensions per range is not yet supported");
-      }
-      RETURN_NOT_OK(partition_schema.CreatePartitionsForRange(
-          range_bound, hash_schema, schema, &partitions));
-
-      // Add information on the new range with custom hash schema into the
-      // PartitionSchema for the table stored in the system catalog.
-      auto* p = l->mutable_data()->pb.mutable_partition_schema();
-      auto* range = p->add_custom_hash_schema_ranges();
-      RowOperationsPBEncoder encoder(range->mutable_range_bounds());
-      encoder.Add(RowOperationsPB::RANGE_LOWER_BOUND, *ops[0].split_row);
-      encoder.Add(RowOperationsPB::RANGE_UPPER_BOUND, *ops[1].split_row);
-      for (const auto& hash_dimension : hash_schema) {
-        auto* hash_dimension_pb = range->add_hash_schema();
-        hash_dimension_pb->set_num_buckets(hash_dimension.num_buckets);
-        hash_dimension_pb->set_seed(hash_dimension.seed);
-        auto* columns = hash_dimension_pb->add_columns();
-        for (const auto& column_id : hash_dimension.column_ids) {
-          columns->set_id(column_id);
-        }
-      }
-    } else {
+    if (!FLAGS_enable_per_range_hash_schemas) {
       RETURN_NOT_OK(partition_schema.CreatePartitions(
           {}, { range_bound }, schema, &partitions));
+    } else {
+      const Schema schema = client_schema.CopyWithColumnIds();
+      if (step.type() == AlterTableRequestPB::ADD_RANGE_PARTITION &&
+          step.add_range_partition().custom_hash_schema_size() > 0) {
+        PartitionSchema::HashSchema hash_schema;
+        RETURN_NOT_OK(PartitionSchema::ExtractHashSchemaFromPB(
+            schema, step.add_range_partition().custom_hash_schema(), &hash_schema));
+        if (partition_schema.hash_schema().size() != hash_schema.size()) {
+          return Status::NotSupported(
+              "varying number of hash dimensions per range is not yet supported");
+        }
+        RETURN_NOT_OK(partition_schema.CreatePartitionsForRange(
+            range_bound, hash_schema, schema, &partitions));
+
+        // Add information on the new range with custom hash schema into the
+        // PartitionSchema for the table stored in the system catalog.
+        auto* p = l->mutable_data()->pb.mutable_partition_schema();
+        auto* range = p->add_custom_hash_schema_ranges();
+        RowOperationsPBEncoder encoder(range->mutable_range_bounds());
+        encoder.Add(RowOperationsPB::RANGE_LOWER_BOUND, range_bound.first);
+        encoder.Add(RowOperationsPB::RANGE_UPPER_BOUND, range_bound.second);
+        for (const auto& hash_dimension : hash_schema) {
+          auto* hash_dimension_pb = range->add_hash_schema();
+          hash_dimension_pb->set_num_buckets(hash_dimension.num_buckets);
+          hash_dimension_pb->set_seed(hash_dimension.seed);
+          auto* columns = hash_dimension_pb->add_columns();
+          for (const auto& column_id : hash_dimension.column_ids) {
+            columns->set_id(column_id);
+          }
+        }
+        ++partition_schema_updates;
+      } else if (step.type() == AlterTableRequestPB::DROP_RANGE_PARTITION) {
+        PartitionSchema::HashSchema range_hash_schema;
+        RETURN_NOT_OK(partition_schema.GetHashSchemaForRange(
+            range_bound.first, schema, &range_hash_schema));
+        RETURN_NOT_OK(partition_schema.CreatePartitionsForRange(
+            range_bound, range_hash_schema, schema, &partitions));
+
+        // Update the partition schema information to be stored in the system
+        // catalog table. The information on a range with the table-wide hash
+        // schema must not be present in the PartitionSchemaPB that the system
+        // catalog stores, so this is necessary only if the range has custom
+        // (i.e. other than the table-wide) hash schema.
+        if (range_hash_schema != partition_schema.hash_schema()) {
+          RETURN_NOT_OK(partition_schema.DropRange(
+              range_bound.first, range_bound.second, schema));
+          PartitionSchemaPB ps_pb;
+          partition_schema.ToPB(schema, &ps_pb);
+          // Make sure exactly one range is gone.
+          DCHECK_EQ(ps_pb.custom_hash_schema_ranges_size() + 1,
+                    l->data().pb.partition_schema().custom_hash_schema_ranges_size());
+          *(l->mutable_data()->pb.mutable_partition_schema()) = std::move(ps_pb);
+          ++partition_schema_updates;
+        }
+      }
     }
 
     switch (step.type()) {
@@ -2792,8 +2830,8 @@ Status CatalogManager::ApplyAlterPartitioningSteps(
 
           const optional<string> dimension_label =
               step.add_range_partition().has_dimension_label()
-              ? boost::make_optional(step.add_range_partition().dimension_label())
-              : none;
+                  ? make_optional(step.add_range_partition().dimension_label())
+                  : nullopt;
           PartitionPB partition_pb;
           partition.ToPB(&partition_pb);
           new_tablets.emplace(lower_bound,
@@ -2858,6 +2896,7 @@ Status CatalogManager::ApplyAlterPartitioningSteps(
     tablets_to_add->emplace_back(std::move(tablet.second));
   }
   abort_mutations.cancel();
+  *partition_schema_updated = partition_schema_updates > 0;
   return Status::OK();
 }
 
@@ -2876,9 +2915,9 @@ Status CatalogManager::AlterTableRpc(const AlterTableRequestPB& req,
   LOG(INFO) << Substitute("Servicing AlterTable request from $0:\n$1",
                           RequestorString(rpc), SecureShortDebugString(req));
 
-  optional<const string&> user;
+  optional<string> user;
   if (rpc) {
-    user = rpc->remote_user().username();
+    user.emplace(rpc->remote_user().username());
   }
   // If the HMS integration is enabled, the alteration includes a table
   // rename and the table should be altered in the HMS, then don't directly
@@ -2900,8 +2939,8 @@ Status CatalogManager::AlterTableRpc(const AlterTableRequestPB& req,
                                                              username, username == owner),
                         resp, MasterErrorPB::NOT_AUTHORIZED);
     };
-    RETURN_NOT_OK(FindLockAndAuthorizeTable(req, resp, LockMode::READ, authz_func, user,
-                                            &table, &l));
+    RETURN_NOT_OK(FindLockAndAuthorizeTable(
+        req, resp, LockMode::READ, authz_func, user, &table, &l));
     RETURN_NOT_OK(CheckIfTableDeletedOrNotRunning(&l, resp));
 
     // The HMS allows renaming a table to the same name (ALTER TABLE t RENAME TO t),
@@ -2958,11 +2997,11 @@ Status CatalogManager::AlterTableRpc(const AlterTableRequestPB& req,
     r.clear_new_table_name();
 
     return AlterTable(r, resp,
-                      /*hms_notification_log_event_id=*/none,
-                      /*user=*/none);
+                      /*hms_notification_log_event_id=*/nullopt,
+                      /*user=*/nullopt);
   }
 
-  return AlterTable(req, resp, /*hms_notification_log_event_id=*/ none, user);
+  return AlterTable(req, resp, /*hms_notification_log_event_id=*/nullopt, user);
 }
 
 Status CatalogManager::AlterTableHms(const string& table_id,
@@ -2976,19 +3015,19 @@ Status CatalogManager::AlterTableHms(const string& table_id,
   req.mutable_table()->set_table_id(table_id);
   req.mutable_table()->set_table_name(table_name);
   if (new_table_name) {
-    req.set_new_table_name(new_table_name.get());
+    req.set_new_table_name(*new_table_name);
   }
   if (new_table_owner) {
-    req.set_new_table_owner(new_table_owner.get());
+    req.set_new_table_owner(*new_table_owner);
   }
   if (new_table_comment) {
-    req.set_new_table_comment(new_table_comment.get());
+    req.set_new_table_comment(*new_table_comment);
   }
 
   // Use empty user to skip the authorization validation since the operation
   // originates from catalog manager. Moreover, this avoids duplicate effort,
   // because we already perform authorization before making any changes to the HMS.
-  RETURN_NOT_OK(AlterTable(req, &resp, notification_log_event_id, /*user=*/none));
+  RETURN_NOT_OK(AlterTable(req, &resp, notification_log_event_id, /*user=*/nullopt));
 
   // Update the cached HMS notification log event ID.
   DCHECK_GT(notification_log_event_id, hms_notification_log_event_id_);
@@ -3000,7 +3039,7 @@ Status CatalogManager::AlterTableHms(const string& table_id,
 Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
                                   AlterTableResponsePB* resp,
                                   optional<int64_t> hms_notification_log_event_id,
-                                  optional<const string&> user) {
+                                  const optional<string>& user) {
   leader_lock_.AssertAcquiredForReading();
 
   // 1. Group the steps into schema altering steps and partition altering steps.
@@ -3079,8 +3118,8 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
                                                            username == owner),
                       resp, MasterErrorPB::NOT_AUTHORIZED);
   };
-  RETURN_NOT_OK(FindLockAndAuthorizeTable(req, resp, LockMode::WRITE, authz_func, user,
-                                          &table, &l));
+  RETURN_NOT_OK(FindLockAndAuthorizeTable(
+      req, resp, LockMode::WRITE, authz_func, user, &table, &l));
   if (l.data().is_deleted()) {
     return SetupError(
         Status::NotFound("the table was deleted", l.data().pb.state_msg()),
@@ -3143,7 +3182,7 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
 
   // Just validate the schema, not the name, owner, or comment (validated below).
   RETURN_NOT_OK(SetupError(
-        ValidateClientSchema(none, none, none, new_schema),
+        ValidateClientSchema(nullopt, nullopt, nullopt, new_schema),
         resp, MasterErrorPB::INVALID_SCHEMA));
 
   // 4. Validate and try to acquire the new table name.
@@ -3216,6 +3255,7 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
   // 7. Alter table partitioning.
   vector<scoped_refptr<TabletInfo>> tablets_to_add;
   vector<scoped_refptr<TabletInfo>> tablets_to_drop;
+  bool partition_schema_updated = false;
   if (!alter_partitioning_steps.empty()) {
     TRACE("Apply alter partitioning");
     Schema client_schema;
@@ -3223,7 +3263,7 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
         resp, MasterErrorPB::UNKNOWN_ERROR));
     RETURN_NOT_OK(SetupError(ApplyAlterPartitioningSteps(
         table, client_schema, alter_partitioning_steps, &l,
-        &tablets_to_add, &tablets_to_drop),
+        &tablets_to_add, &tablets_to_drop, &partition_schema_updated),
                              resp, MasterErrorPB::UNKNOWN_ERROR));
   }
 
@@ -3233,7 +3273,7 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
     int num_replicas = req.num_replicas();
     RETURN_NOT_OK(ValidateNumberReplicas(normalized_table_name,
                                          resp, ValidateType::kAlterTable,
-                                         boost::none, num_replicas));
+                                         nullopt, num_replicas));
     if (num_replicas != l.data().pb.num_replicas()) {
       num_replicas_changed = true;
       l.mutable_data()->pb.set_num_replicas(num_replicas);
@@ -3255,18 +3295,19 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
   }
 
   // Set to true if columns are altered, added or dropped.
-  bool has_schema_changes = !alter_schema_steps.empty();
+  const bool has_schema_changes = !alter_schema_steps.empty();
   // Set to true if there are schema changes, the table is renamed,
   // or if any other table properties changed.
-  bool has_metadata_changes = has_schema_changes ||
+  const bool has_metadata_changes = has_schema_changes ||
       req.has_new_table_name() || req.has_new_table_owner() ||
       !req.new_extra_configs().empty() || req.has_disk_size_limit() ||
       req.has_row_count_limit() || req.has_new_table_comment() ||
       num_replicas_changed;
   // Set to true if there are partitioning changes.
-  bool has_partitioning_changes = !alter_partitioning_steps.empty();
+  const bool has_partitioning_changes = !alter_partitioning_steps.empty() ||
+      partition_schema_updated;
   // Set to true if metadata changes need to be applied to existing tablets.
-  bool has_metadata_changes_for_existing_tablets =
+  const bool has_metadata_changes_for_existing_tablets =
     has_metadata_changes &&
     (table->num_tablets() > tablets_to_drop.size() || num_replicas_changed);
 
@@ -3412,7 +3453,7 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
     }
   }
 
-  if (!tablets_to_add.empty() || has_metadata_changes) {
+  if (!tablets_to_add.empty() || has_metadata_changes || partition_schema_updated) {
     l.Commit();
   } else {
     l.Unlock();
@@ -3439,7 +3480,7 @@ Status CatalogManager::AlterTable(const AlterTableRequestPB& req,
 
 Status CatalogManager::IsAlterTableDone(const IsAlterTableDoneRequestPB* req,
                                         IsAlterTableDoneResponsePB* resp,
-                                        optional<const string&> user) {
+                                        const optional<string>& user) {
   leader_lock_.AssertAcquiredForReading();
 
   // 1. Lookup the table, verify if it exists, and then check that
@@ -3451,8 +3492,8 @@ Status CatalogManager::IsAlterTableDone(const IsAlterTableDoneRequestPB* req,
                                                                  username == owner),
                       resp, MasterErrorPB::NOT_AUTHORIZED);
   };
-  RETURN_NOT_OK(FindLockAndAuthorizeTable(*req, resp, LockMode::READ, authz_func, user,
-                                          &table, &l));
+  RETURN_NOT_OK(FindLockAndAuthorizeTable(
+      *req, resp, LockMode::READ, authz_func, user, &table, &l));
   RETURN_NOT_OK(CheckIfTableDeletedOrNotRunning(&l, resp));
 
   // 2. Verify if the alter is in-progress
@@ -3465,7 +3506,7 @@ Status CatalogManager::IsAlterTableDone(const IsAlterTableDoneRequestPB* req,
 
 Status CatalogManager::GetTableSchema(const GetTableSchemaRequestPB* req,
                                       GetTableSchemaResponsePB* resp,
-                                      optional<const string&> user,
+                                      const optional<string>& user,
                                       const TokenSigner* token_signer) {
   leader_lock_.AssertAcquiredForReading();
 
@@ -3479,8 +3520,8 @@ Status CatalogManager::GetTableSchema(const GetTableSchemaRequestPB* req,
                                                                  username == owner),
                       resp, MasterErrorPB::NOT_AUTHORIZED);
   };
-  RETURN_NOT_OK(FindLockAndAuthorizeTable(*req, resp, LockMode::READ, authz_func, user,
-                                          &table, &l));
+  RETURN_NOT_OK(FindLockAndAuthorizeTable(
+      *req, resp, LockMode::READ, authz_func, user, &table, &l));
   RETURN_NOT_OK(CheckIfTableDeletedOrNotRunning(&l, resp));
 
   // If fully_applied_schema is set, use it, since an alter is in progress.
@@ -3492,8 +3533,7 @@ Status CatalogManager::GetTableSchema(const GetTableSchemaRequestPB* req,
   if (token_signer && user) {
     TablePrivilegePB table_privilege;
     table_privilege.set_table_id(table->id());
-    RETURN_NOT_OK(
-        SetupError(authz_provider_->FillTablePrivilegePB(l.data().name(), *user,
+    RETURN_NOT_OK(SetupError(authz_provider_->FillTablePrivilegePB(l.data().name(), *user,
                                                          *user == l.data().owner(),
                                                          schema_pb, &table_privilege),
                    resp, MasterErrorPB::UNKNOWN_ERROR));
@@ -3515,14 +3555,12 @@ Status CatalogManager::GetTableSchema(const GetTableSchemaRequestPB* req,
   resp->set_owner(l.data().pb.owner());
   resp->set_comment(l.data().pb.comment());
 
-  RETURN_NOT_OK(ExtraConfigPBToPBMap(l.data().pb.extra_config(), resp->mutable_extra_configs()));
-
-  return Status::OK();
+  return ExtraConfigPBToPBMap(l.data().pb.extra_config(), resp->mutable_extra_configs());
 }
 
 Status CatalogManager::ListTables(const ListTablesRequestPB* req,
                                   ListTablesResponsePB* resp,
-                                  optional<const string&> user) {
+                                  const optional<string>& user) {
   leader_lock_.AssertAcquiredForReading();
 
   vector<scoped_refptr<TableInfo>> tables_info;
@@ -3618,7 +3656,7 @@ Status CatalogManager::ListTables(const ListTablesRequestPB* req,
 
 Status CatalogManager::GetTableStatistics(const GetTableStatisticsRequestPB* req,
                                           GetTableStatisticsResponsePB* resp,
-                                          optional<const string&> user) {
+                                          const optional<string>& user) {
   leader_lock_.AssertAcquiredForReading();
 
   scoped_refptr<TableInfo> table;
@@ -4551,8 +4589,8 @@ bool AsyncAddReplicaTask::SendRequest(int attempt) {
     TSDescriptorVector ts_descs;
     master_->ts_manager()->GetDescriptorsAvailableForPlacement(&ts_descs);
 
-    // Get the dimension of the tablet. Otherwise, it will be none.
-    optional<string> dimension = none;
+    // Get the dimension of the tablet. Otherwise, it will be nullopt.
+    optional<string> dimension = nullopt;
     {
       TabletMetadataLock l(tablet_.get(), LockMode::READ);
       if (tablet_->metadata().state().pb.has_dimension_label()) {
@@ -4796,7 +4834,7 @@ Status CatalogManager::ProcessTabletReport(
       // where that might be possible (tablet creation timeout & replacement).
       rpcs.emplace_back(new AsyncDeleteReplica(
           master_, ts_desc->permanent_uuid(), table.get(), tablet_id,
-          TABLET_DATA_DELETED, none, msg));
+          TABLET_DATA_DELETED, nullopt, msg));
       continue;
     }
 
@@ -5203,7 +5241,7 @@ void CatalogManager::SendDeleteTabletRequest(const scoped_refptr<TabletInfo>& ta
   for (const auto& peer : cstate.committed_config().peers()) {
     scoped_refptr<AsyncDeleteReplica> task = new AsyncDeleteReplica(
         master_, peer.permanent_uuid(), tablet->table().get(), tablet->id(),
-        TABLET_DATA_DELETED, none, deletion_msg);
+        TABLET_DATA_DELETED, nullopt, deletion_msg);
     tablet->table()->AddTask(tablet->id(), task);
     WARN_NOT_OK(task->Run(), Substitute(
         "Failed to send DeleteReplica request for tablet $0", tablet->id()));
@@ -5367,8 +5405,7 @@ void CatalogManager::HandleAssignCreatingTablet(const scoped_refptr<TabletInfo>&
   const PersistentTabletInfo& old_info = tablet->metadata().state();
 
   const optional<string> dimension_label = old_info.pb.has_dimension_label()
-      ? boost::make_optional(old_info.pb.dimension_label())
-      : none;
+      ? make_optional(old_info.pb.dimension_label()) : nullopt;
   // The "tablet creation" was already sent, but we didn't receive an answer
   // within the timeout. So the tablet will be replaced by a new one.
   scoped_refptr<TabletInfo> replacement = CreateTabletInfo(tablet->table(),
@@ -5586,8 +5623,8 @@ Status CatalogManager::SelectReplicasForTablet(const PlacementPolicy& policy,
   config->set_obsolete_local(nreplicas == 1);
   config->set_opid_index(consensus::kInvalidOpIdIndex);
 
-  // Get the dimension of the tablet. Otherwise, it will be none.
-  optional<string> dimension = none;
+  // Get the dimension of the tablet. Otherwise, it will be nullopt.
+  optional<string> dimension = nullopt;
   if (tablet->metadata().state().pb.has_dimension_label()) {
     dimension = tablet->metadata().state().pb.dimension_label();
   }
@@ -5756,8 +5793,7 @@ Status CatalogManager::BuildLocationsForTablet(
 
     const auto role = GetParticipantRole(peer, cstate);
     const optional<string> dimension = l_tablet.data().pb.has_dimension_label()
-        ? boost::make_optional(l_tablet.data().pb.dimension_label())
-        : none;
+        ? make_optional(l_tablet.data().pb.dimension_label()) : nullopt;
     if (ts_infos_dict) {
       const auto idx = ts_infos_dict->LookupOrAdd(peer.permanent_uuid(), fill_tsinfo_pb);
       auto* interned_replica_pb = locs_pb->add_interned_replicas();
@@ -5788,7 +5824,7 @@ Status CatalogManager::GetTabletLocations(const string& tablet_id,
                                           ReplicaTypeFilter filter,
                                           TabletLocationsPB* locs_pb,
                                           TSInfosDict* ts_infos_dict,
-                                          optional<const string&> user) {
+                                          const optional<string>& user) {
   leader_lock_.AssertAcquiredForReading();
 
   locs_pb->mutable_deprecated_replicas()->Clear();
@@ -5906,7 +5942,7 @@ Status CatalogManager::ReplaceTablet(const string& tablet_id, ReplaceTabletRespo
 
 Status CatalogManager::GetTableLocations(const GetTableLocationsRequestPB* req,
                                          GetTableLocationsResponsePB* resp,
-                                         optional<const string&> user) {
+                                         const optional<string>& user) {
   // If start-key is > end-key report an error instead of swapping the two
   // since probably there is something wrong app-side.
   if (PREDICT_FALSE(req->has_partition_key_start() && req->has_partition_key_end()
@@ -5937,8 +5973,8 @@ Status CatalogManager::GetTableLocations(const GetTableLocationsRequestPB* req,
                                                                  username == owner),
                       resp, MasterErrorPB::NOT_AUTHORIZED);
   };
-  RETURN_NOT_OK(FindLockAndAuthorizeTable(*req, resp, LockMode::READ, authz_func, user,
-                                          &table, &l));
+  RETURN_NOT_OK(FindLockAndAuthorizeTable(
+      *req, resp, LockMode::READ, authz_func, user, &table, &l));
   RETURN_NOT_OK(CheckIfTableDeletedOrNotRunning(&l, resp));
 
   vector<scoped_refptr<TabletInfo>> tablets_in_range;
@@ -6106,9 +6142,10 @@ Status CatalogManager::WaitForNotificationLogListenerCatchUp(RespClass* resp,
 }
 
 template<typename RespClass>
-Status CatalogManager::ValidateNumberReplicas(const std::string& normalized_table_name,
-                                              RespClass* resp, ValidateType type,
-                                              const boost::optional<int>& partitions_count,
+Status CatalogManager::ValidateNumberReplicas(const string& normalized_table_name,
+                                              RespClass* resp,
+                                              ValidateType type,
+                                              const optional<int>& partitions_count,
                                               int num_replicas) {
   if (num_replicas > FLAGS_max_num_replicas) {
     return SetupError(Status::InvalidArgument(
@@ -6295,7 +6332,7 @@ Status CatalogManager::InitiateMasterChangeConfig(ChangeConfigOp op, const HostP
       rpc->RespondFailure(completion_status);
     }
   };
-  boost::optional<TabletServerErrorPB::Code> err_code;
+  optional<TabletServerErrorPB::Code> err_code;
   RETURN_NOT_OK_PREPEND(
       consensus->ChangeConfig(req, completion_cb, &err_code),
       Substitute("Failed initiating master Raft ChangeConfig request, error: $0",
