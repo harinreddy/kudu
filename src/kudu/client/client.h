@@ -1274,6 +1274,7 @@ class KUDU_EXPORT KuduTableCreator {
     class KUDU_NO_EXPORT Data;
 
     friend class KuduTableCreator;
+    friend class KuduTableAlterer;
 
     // Owned.
     Data* data_;
@@ -1314,7 +1315,7 @@ class KUDU_EXPORT KuduTableCreator {
                                         RangePartitionBound lower_bound_type = INCLUSIVE_BOUND,
                                         RangePartitionBound upper_bound_type = EXCLUSIVE_BOUND);
 
-  /// Add a range partition with a custom hash bucket schema.
+  /// Add a range partition with a custom hash schema.
   ///
   /// This method allows adding a range partition which has hash partitioning
   /// schema different from the table-wide one.
@@ -1325,11 +1326,9 @@ class KUDU_EXPORT KuduTableCreator {
   /// @li To create a range with the table-wide hash schema, use
   ///   @c KuduTableCreator::add_range_partition() instead.
   ///
-  /// @warning This functionality isn't fully implemented yet.
-  ///
   /// @param [in] partition
-  ///   Range partition with custom hash bucket schema.
-  ///   The KuduTableCreator object takes ownership of the parameter.
+  ///   Range partition with range-specific hash schema.
+  ///   The KuduTableCreator object takes ownership of the partition object.
   /// @return Reference to the modified table creator.
   KuduTableCreator& add_custom_range_partition(
       KuduRangePartition* partition);
@@ -1889,6 +1888,26 @@ class KUDU_EXPORT KuduTableAlterer {
       KuduPartialRow* upper_bound,
       KuduTableCreator::RangePartitionBound lower_bound_type = KuduTableCreator::INCLUSIVE_BOUND,
       KuduTableCreator::RangePartitionBound upper_bound_type = KuduTableCreator::EXCLUSIVE_BOUND);
+
+  /// Add the specified range partition with custom hash schema to the table.
+  ///
+  /// @note The table alterer takes ownership of the partition object.
+  ///
+  /// @note Multiple range partitions may be added as part of a single alter
+  ///   table transaction by calling this method multiple times on the table
+  ///   alterer.
+  ///
+  /// @note This client may immediately write and scan the new tablets when
+  ///   Alter() returns success, however other existing clients may have to wait
+  ///   for a timeout period to elapse before the tablets become visible. This
+  ///   period is configured by the master's 'table_locations_ttl_ms' flag, and
+  ///   defaults to 5 minutes.
+  ///
+  /// @param [in] partition
+  ///   The range partition to be created: it can have a custom hash schema.
+  /// @return Raw pointer to this alterer object.
+  KuduTableAlterer* AddRangePartition(
+      KuduTableCreator::KuduRangePartition* partition);
 
   /// Add a range partition to the table with dimension label.
   ///
@@ -3056,6 +3075,7 @@ class KUDU_EXPORT KuduScanner {
   Status NextBatch(internal::ScanBatchDataInterface* batch);
 
   friend class KuduScanToken;
+  friend class FlexPartitioningTest;
   FRIEND_TEST(ClientTest, TestBlockScannerHijackingAttempts);
   FRIEND_TEST(ClientTest, TestScanCloseProxy);
   FRIEND_TEST(ClientTest, TestScanFaultTolerance);

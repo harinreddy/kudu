@@ -1029,10 +1029,14 @@ Status KuduTableCreator::Create() {
   }
 
   CreateTableResponsePB resp;
-  RETURN_NOT_OK_PREPEND(data_->client_->data_->CreateTable(
-      data_->client_, req, &resp, deadline, !data_->range_partitions_.empty()),
-                        Substitute("Error creating table $0 on the master",
-                                   data_->table_name_));
+  RETURN_NOT_OK_PREPEND(
+      data_->client_->data_->CreateTable(data_->client_,
+                                         req,
+                                         &resp,
+                                         deadline,
+                                         !data_->range_partitions_.empty(),
+                                         has_range_with_custom_hash_schema),
+      Substitute("Error creating table $0 on the master", data_->table_name_));
   // Spin until the table is fully created, if requested.
   if (data_->wait_) {
     TableIdentifierPB table;
@@ -1485,7 +1489,7 @@ KuduTableAlterer* KuduTableAlterer::SetComment(const string& new_comment) {
 
 KuduColumnSpec* KuduTableAlterer::AddColumn(const string& name) {
   Data::Step s = { AlterTableRequestPB::ADD_COLUMN,
-                   new KuduColumnSpec(name), nullptr, nullptr };
+                   new KuduColumnSpec(name), nullptr };
   auto* spec = s.spec;
   data_->steps_.emplace_back(std::move(s));
   return spec;
@@ -1493,7 +1497,7 @@ KuduColumnSpec* KuduTableAlterer::AddColumn(const string& name) {
 
 KuduColumnSpec* KuduTableAlterer::AlterColumn(const string& name) {
   Data::Step s = { AlterTableRequestPB::ALTER_COLUMN,
-                   new KuduColumnSpec(name), nullptr, nullptr };
+                   new KuduColumnSpec(name), nullptr };
   auto* spec = s.spec;
   data_->steps_.emplace_back(std::move(s));
   return spec;
@@ -1501,7 +1505,7 @@ KuduColumnSpec* KuduTableAlterer::AlterColumn(const string& name) {
 
 KuduTableAlterer* KuduTableAlterer::DropColumn(const string& name) {
   Data::Step s = { AlterTableRequestPB::DROP_COLUMN,
-                   new KuduColumnSpec(name), nullptr, nullptr };
+                   new KuduColumnSpec(name), nullptr };
   data_->steps_.emplace_back(std::move(s));
   return this;
 }
@@ -1539,13 +1543,42 @@ KuduTableAlterer* KuduTableAlterer::AddRangePartitionWithDimension(
 
   Data::Step s { AlterTableRequestPB::ADD_RANGE_PARTITION,
                  nullptr,
-                 unique_ptr<KuduPartialRow>(lower_bound),
-                 unique_ptr<KuduPartialRow>(upper_bound),
-                 lower_bound_type,
-                 upper_bound_type,
+                 std::unique_ptr<KuduTableCreator::KuduRangePartition>(
+                     new KuduTableCreator::KuduRangePartition(
+                         lower_bound, upper_bound, lower_bound_type, upper_bound_type)),
                  dimension_label.empty() ? nullopt : make_optional(dimension_label) };
   data_->steps_.emplace_back(std::move(s));
   data_->has_alter_partitioning_steps = true;
+  return this;
+}
+
+KuduTableAlterer* KuduTableAlterer::AddRangePartition(
+    KuduTableCreator::KuduRangePartition* partition) {
+  CHECK(partition);
+  if (partition->data_->lower_bound_ == nullptr || partition->data_->upper_bound_  == nullptr) {
+    data_->status_ = Status::InvalidArgument("range partition bounds may not be null");
+    return this;
+  }
+  if (partition->data_->lower_bound_->schema() != partition->data_->upper_bound_->schema()) {
+    data_->status_ = Status::InvalidArgument("range partition bounds must have matching schemas");
+    return this;
+  }
+  if (data_->schema_ == nullptr) {
+    data_->schema_ = partition->data_->lower_bound_->schema();
+  } else if (partition->data_->lower_bound_->schema() != data_->schema_) {
+    data_->status_ = Status::InvalidArgument("range partition bounds must have matching schemas");
+    return this;
+  }
+
+  Data::Step s { AlterTableRequestPB::ADD_RANGE_PARTITION,
+                 nullptr,
+                 std::unique_ptr<KuduTableCreator::KuduRangePartition>(partition),
+                 nullopt };
+  data_->steps_.emplace_back(std::move(s));
+  data_->has_alter_partitioning_steps = true;
+  if (!data_->steps_.back().range_partition->data_->is_table_wide_hash_schema_) {
+    data_->adding_range_with_custom_hash_schema = true;
+  }
   return this;
 }
 
@@ -1571,10 +1604,9 @@ KuduTableAlterer* KuduTableAlterer::DropRangePartition(
 
   Data::Step s { AlterTableRequestPB::DROP_RANGE_PARTITION,
                  nullptr,
-                 unique_ptr<KuduPartialRow>(lower_bound),
-                 unique_ptr<KuduPartialRow>(upper_bound),
-                 lower_bound_type,
-                 upper_bound_type };
+                 std::unique_ptr<KuduTableCreator::KuduRangePartition>(
+                     new KuduTableCreator::KuduRangePartition(
+                         lower_bound, upper_bound, lower_bound_type, upper_bound_type)) };
   data_->steps_.emplace_back(std::move(s));
   data_->has_alter_partitioning_steps = true;
   return this;
@@ -1620,8 +1652,10 @@ Status KuduTableAlterer::Alter() {
     data_->timeout_ :
     data_->client_->default_admin_operation_timeout();
   MonoTime deadline = MonoTime::Now() + timeout;
-  RETURN_NOT_OK(data_->client_->data_->AlterTable(data_->client_, req, &resp, deadline,
-                                                  data_->has_alter_partitioning_steps));
+  RETURN_NOT_OK(data_->client_->data_->AlterTable(
+      data_->client_, req, &resp, deadline,
+      data_->has_alter_partitioning_steps,
+      data_->adding_range_with_custom_hash_schema));
 
   if (data_->has_alter_partitioning_steps) {
     // If the table partitions change, clear the local meta cache so that the
@@ -1993,7 +2027,6 @@ Status KuduScanner::NextBatch(internal::ScanBatchDataInterface* batch_data) {
   // need to do some swapping of the response objects around to avoid
   // stomping on the memory the user is looking at.
   CHECK(data_->open_);
-  CHECK(data_->proxy_);
 
   batch_data->Clear();
 
@@ -2003,6 +2036,7 @@ Status KuduScanner::NextBatch(internal::ScanBatchDataInterface* batch_data) {
 
   if (data_->data_in_open_) {
     // We have data from a previous scan.
+    CHECK(data_->proxy_);
     VLOG(2) << "Extracting data from " << data_->DebugString();
     data_->data_in_open_ = false;
     return batch_data->Reset(&data_->controller_,
@@ -2014,6 +2048,7 @@ Status KuduScanner::NextBatch(internal::ScanBatchDataInterface* batch_data) {
 
   if (data_->last_response_.has_more_results()) {
     // More data is available in this tablet.
+    CHECK(data_->proxy_);
     VLOG(2) << "Continuing " << data_->DebugString();
 
     MonoTime batch_deadline = MonoTime::Now() + data_->configuration().timeout();
