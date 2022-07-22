@@ -105,7 +105,7 @@ class DependencyExtractor(object):
 
     deps = []
     for line in out.splitlines():
-      match = LDD_RE.match(line.decode('utf-8'))
+      match = LDD_RE.match(line)
       if not match:
         continue
       dep = match.group(1)
