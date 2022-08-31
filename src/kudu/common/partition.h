@@ -382,11 +382,18 @@ class PartitionSchema {
   bool PartitionMayContainRow(const Partition& partition,
                               const KuduPartialRow& row) const;
 
+  // Used to determine whether the partition keys information shows up.
+  enum HashPartitionInfo {
+    HIDE = 0,
+    SHOW = 1,
+  };
+
   // Returns a text description of the partition suitable for debug printing.
   //
   // Partitions are considered metadata, so no redaction will happen on the hash
   // and range bound values.
-  std::string PartitionDebugString(const Partition& partition, const Schema& schema) const;
+  std::string PartitionDebugString(const Partition& partition, const Schema& schema,
+                                   HashPartitionInfo hp = HashPartitionInfo::SHOW) const;
 
   // Returns a text description of a partition key suitable for debug printing.
   std::string PartitionKeyDebugString(const PartitionKey& key,
@@ -636,7 +643,14 @@ class PartitionSchema {
   // method fills in the address space to have the proper ordering of the
   // serialized partition keys -- that's important for partition pruning and
   // overall ordering of the serialized partition keys.
-  void UpdatePartitionBoundaries(std::vector<Partition>* partitions) const;
+  void UpdatePartitionBoundaries(const KeyEncoder<std::string>& hash_encoder,
+                                 std::vector<Partition>* partitions) const;
+  // Similar to the above, but update the boundaries for just a single partition
+  // specified along with its hash schema.
+  static void UpdatePartitionBoundaries(
+      const KeyEncoder<std::string>& hash_encoder,
+      const HashSchema& partition_hash_schema,
+      Partition* partition);
 
   // Validates the split rows, converts them to partition key form, and inserts
   // them into splits in sorted order.

@@ -25,8 +25,8 @@
 #include <memory>
 #include <ostream>
 #include <string>
-#include <thread>
 #include <tuple>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -44,6 +44,8 @@
 #include "kudu/client/write_op.h"
 #include "kudu/common/common.pb.h"
 #include "kudu/common/partial_row.h"
+#include "kudu/common/partition.h"
+#include "kudu/common/schema.h"
 #include "kudu/common/wire_protocol.pb.h"
 #include "kudu/consensus/consensus.pb.h"
 #include "kudu/consensus/metadata.pb.h"
@@ -74,6 +76,7 @@
 #include "kudu/tools/tool_test_util.h"
 #include "kudu/tserver/tablet_server-test-base.h"
 #include "kudu/util/cow_object.h"
+#include "kudu/util/env.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/net/sockaddr.h"
@@ -111,6 +114,7 @@ using kudu::consensus::OpId;
 using kudu::itest::FindTabletFollowers;
 using kudu::itest::FindTabletLeader;
 using kudu::itest::GetConsensusState;
+using kudu::itest::ListTablesWithInfo;
 using kudu::itest::StartElection;
 using kudu::itest::WaitUntilLeader;
 using kudu::itest::TabletServerMap;
@@ -138,7 +142,7 @@ using std::deque;
 using std::endl;
 using std::ostringstream;
 using std::string;
-using std::thread;
+using std::pair;
 using std::tuple;
 using std::unique_ptr;
 using std::vector;
@@ -1648,7 +1652,8 @@ TEST_F(AdminCliTest, TestDeleteTable) {
     "table",
     "delete",
     master_address,
-    kTableId
+    kTableId,
+    "-reserve_seconds=0"
   );
 
   vector<string> tables;
@@ -1662,16 +1667,51 @@ TEST_F(AdminCliTest, TestListTables) {
 
   NO_FATALS(BuildAndStart());
 
-  string stdout;
-  ASSERT_OK(RunKuduTool({
-    "table",
-    "list",
-    cluster_->master()->bound_rpc_addr().ToString()
-  }, &stdout));
+  {
+    string stdout;
+    ASSERT_OK(RunKuduTool({
+      "table",
+      "list",
+      cluster_->master()->bound_rpc_addr().ToString()
+    }, &stdout));
 
-  vector<string> stdout_lines = Split(stdout, ",", strings::SkipEmpty());
-  ASSERT_EQ(1, stdout_lines.size());
-  ASSERT_EQ(Substitute("$0\n", kTableId), stdout_lines[0]);
+    vector<string> stdout_lines = Split(stdout, ",", strings::SkipEmpty());
+    ASSERT_EQ(1, stdout_lines.size());
+    ASSERT_EQ(Substitute("$0\n", kTableId), stdout_lines[0]);
+  }
+
+  {
+    string stdout;
+    ASSERT_OK(RunKuduTool({
+      "table",
+      "list",
+      "-soft_deleted_only=true",
+      cluster_->master()->bound_rpc_addr().ToString()
+    }, &stdout));
+
+    vector<string> stdout_lines = Split(stdout, ",", strings::SkipEmpty());
+    ASSERT_EQ(0, stdout_lines.size());
+
+    ASSERT_OK(RunKuduTool({
+      "table",
+      "delete",
+      cluster_->master()->bound_rpc_addr().ToString(),
+      kTableId
+    }, &stdout));
+
+    stdout.clear();
+    ASSERT_OK(RunKuduTool({
+      "table",
+      "list",
+      "-soft_deleted_only=true",
+      cluster_->master()->bound_rpc_addr().ToString()
+    }, &stdout));
+
+    stdout_lines.clear();
+    stdout_lines = Split(stdout, ",", strings::SkipEmpty());
+    ASSERT_EQ(1, stdout_lines.size());
+    ASSERT_EQ(Substitute("$0\n", kTableId), stdout_lines[0]);
+  }
 }
 
 TEST_F(AdminCliTest, TestListTablesDetail) {
@@ -2081,6 +2121,171 @@ TEST_F(AdminCliTest, TestDescribeTableNoOwner) {
       &stdout));
   ASSERT_STR_CONTAINS(stdout, "OWNER \n");
 }
+
+TEST_F(AdminCliTest, TestDescribeTableCustomHashSchema) {
+  NO_FATALS(BuildAndStart({}, {}, {}, /*create_table*/false));
+  KuduSchema schema;
+
+  // Build the schema
+  {
+    KuduSchemaBuilder builder;
+    builder.AddColumn("key_range")->Type(KuduColumnSchema::INT32)->NotNull();
+    builder.AddColumn("key_hash0")->Type(KuduColumnSchema::INT32)->NotNull();
+    builder.AddColumn("key_hash1")->Type(KuduColumnSchema::INT32)->NotNull();
+    builder.SetPrimaryKey({"key_range", "key_hash0", "key_hash1"});
+    ASSERT_OK(builder.Build(&schema));
+  }
+
+  constexpr const char* const kTableName = "table_with_custom_hash_schema";
+  unique_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
+  table_creator->table_name(kTableName)
+      .schema(&schema)
+      .add_hash_partitions({"key_hash0"}, 2)
+      .set_range_partition_columns({"key_range"})
+      .num_replicas(1);
+
+  // Create a KuduRangePartition with custom hash schema
+  {
+    unique_ptr<KuduPartialRow> lower(schema.NewRow());
+    CHECK_OK(lower->SetInt32("key_range", 0));
+    unique_ptr<KuduPartialRow> upper(schema.NewRow());
+    CHECK_OK(upper->SetInt32("key_range", 100));
+    unique_ptr<client::KuduRangePartition> partition(
+        new client::KuduRangePartition(lower.release(), upper.release()));
+    partition->add_hash_partitions({"key_hash1"}, 3);
+    table_creator->add_custom_range_partition(partition.release());
+  }
+
+  // Create a partition with table wide hash schema
+  {
+    unique_ptr<KuduPartialRow> lower(schema.NewRow());
+    CHECK_OK(lower->SetInt32("key_range", 100));
+    unique_ptr<KuduPartialRow> upper(schema.NewRow());
+    CHECK_OK(upper->SetInt32("key_range", 200));
+    table_creator->add_range_partition(lower.release(), upper.release());
+  }
+
+  // Create the table and run the tool
+  ASSERT_OK(table_creator->Create());
+  string stdout;
+  ASSERT_OK(RunKuduTool(
+      {
+          "table",
+          "describe",
+          cluster_->master()->bound_rpc_addr().ToString(),
+          kTableName,
+      },
+      &stdout));
+  ASSERT_STR_CONTAINS(stdout, "PARTITION 0 <= VALUES < 100 HASH(key_hash1) PARTITIONS 3,\n"
+                              "    PARTITION 100 <= VALUES < 200");
+}
+
+class ListTableCliParamTest : public AdminCliTest,
+                              public ::testing::WithParamInterface<bool> {
+};
+
+// Basic test that the kudu tool works in the list tablets case.
+TEST_P(ListTableCliParamTest, ListTabletWithPartitionInfo) {
+  const auto show_hp = GetParam() ? PartitionSchema::HashPartitionInfo::SHOW
+                                  : PartitionSchema::HashPartitionInfo::HIDE;
+  const auto kTimeout = MonoDelta::FromSeconds(30);
+  FLAGS_num_tablet_servers = 1;
+  FLAGS_num_replicas = 1;
+
+  NO_FATALS(BuildAndStart());
+
+  vector<TServerDetails*> tservers;
+  vector<string> base_tablet_ids;
+  AppendValuesFromMap(tablet_servers_, &tservers);
+  ListRunningTabletIds(tservers.front(), kTimeout, &base_tablet_ids);
+
+  // Test a table with all types in its schema, multiple hash partitioning
+  // levels, multiple range partitions, and non-covered ranges.
+  constexpr const char* const kTableName = "TestTableListPartition";
+  KuduSchema schema;
+
+  // Build the schema.
+  {
+    KuduSchemaBuilder builder;
+    builder.AddColumn("key_hash0")->Type(KuduColumnSchema::INT32)->NotNull();
+    builder.AddColumn("key_hash1")->Type(KuduColumnSchema::INT32)->NotNull();
+    builder.AddColumn("key_hash2")->Type(KuduColumnSchema::INT32)->NotNull();
+    builder.AddColumn("key_range")->Type(KuduColumnSchema::INT32)->NotNull();
+    builder.SetPrimaryKey({ "key_hash0", "key_hash1", "key_hash2", "key_range" });
+    ASSERT_OK(builder.Build(&schema));
+  }
+
+  // Set up partitioning and create the table.
+  {
+    unique_ptr<KuduPartialRow> lower_bound0(schema.NewRow());
+    ASSERT_OK(lower_bound0->SetInt32("key_range", 0));
+    unique_ptr<KuduPartialRow> upper_bound0(schema.NewRow());
+    ASSERT_OK(upper_bound0->SetInt32("key_range", 1));
+    unique_ptr<KuduPartialRow> lower_bound1(schema.NewRow());
+    ASSERT_OK(lower_bound1->SetInt32("key_range", 2));
+    unique_ptr<KuduPartialRow> upper_bound1(schema.NewRow());
+    ASSERT_OK(upper_bound1->SetInt32("key_range", 3));
+    unique_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
+    ASSERT_OK(table_creator->table_name(kTableName)
+        .schema(&schema)
+        .add_hash_partitions({"key_hash0"}, 2)
+        .add_hash_partitions({"key_hash1", "key_hash2"}, 3)
+        .set_range_partition_columns({"key_range"})
+        .add_range_partition(lower_bound0.release(), upper_bound0.release())
+        .add_range_partition(lower_bound1.release(), upper_bound1.release())
+        .num_replicas(FLAGS_num_replicas)
+        .Create());
+  }
+
+  vector<string> new_tablet_ids;
+  ListRunningTabletIds(tservers.front(), kTimeout, &new_tablet_ids);
+  vector<string> delta_tablet_ids;
+  for (auto& tablet_id : base_tablet_ids) {
+    if (std::find(new_tablet_ids.begin(), new_tablet_ids.end(), tablet_id) ==
+        new_tablet_ids.end()) {
+      delta_tablet_ids.push_back(tablet_id);
+    }
+  }
+
+  // Test the list tablet with partition output.
+  string stdout;
+  string stderr;
+  Status s = RunKuduTool({
+    "table",
+    "list",
+    "--list_tablets",
+    "--show_tablet_partition_info",
+    Substitute("--show_hash_partition_info=$0", GetParam()),
+    "--tables",
+    kTableName,
+    cluster_->master()->bound_rpc_addr().ToString(),
+  }, &stdout, &stderr);
+  ASSERT_TRUE(s.ok()) << ToolRunInfo(s, stdout, stderr);
+
+  client::sp::shared_ptr<KuduTable> table;
+  ASSERT_OK(client_->OpenTable(kTableName, &table));
+  const auto& partition_schema = table->partition_schema();
+  const auto& schema_internal = KuduSchema::ToSchema(table->schema());
+
+  // make sure table name correct
+  ASSERT_STR_CONTAINS(stdout, kTableName);
+
+  master::ListTablesResponsePB tables_info;
+  ASSERT_OK(ListTablesWithInfo(
+      cluster_->master_proxy(), kTableName, kTimeout, &tables_info));
+  for (const auto& table : tables_info.tables()) {
+    for (const auto& pt : table.tablet_with_partition()) {
+      Partition partition;
+      Partition::FromPB(pt.partition(), &partition);
+      const auto partition_str = partition_schema.PartitionDebugString(
+          partition, schema_internal, show_hp);
+      const auto tablet_with_partition = pt.tablet_id() + " : " + partition_str;
+      ASSERT_STR_CONTAINS(stdout, tablet_with_partition);
+    }
+  }
+}
+INSTANTIATE_TEST_SUITE_P(IsHashPartitionInfoShown, ListTableCliParamTest,
+                         ::testing::Bool());
 
 TEST_F(AdminCliTest, TestLocateRow) {
   FLAGS_num_tablet_servers = 1;
@@ -3046,6 +3251,162 @@ TEST_F(AdminCliTest, TestAddAndDropRangePartitionForMultipleRangeColumnsTable) {
   });
 }
 
+TEST_F(AdminCliTest, AddAndDropRangeWithCustomHashSchema) {
+  FLAGS_num_tablet_servers = 1;
+  FLAGS_num_replicas = 1;
+
+  NO_FATALS(BuildAndStart());
+
+  const string& master_addr = cluster_->master()->bound_rpc_addr().ToString();
+  constexpr const char* const kTestTableName = "custom_hash_schemas";
+  constexpr const char* const kC0 = "c0";
+  constexpr const char* const kC1 = "c1";
+  constexpr const char* const kC2 = "c2";
+
+  {
+    KuduSchemaBuilder builder;
+    builder.AddColumn(kC0)->Type(KuduColumnSchema::INT8)->NotNull();
+    builder.AddColumn(kC1)->Type(KuduColumnSchema::INT16)->NotNull();
+    builder.AddColumn(kC2)->Type(KuduColumnSchema::STRING);
+    builder.SetPrimaryKey({ kC0, kC1 });
+    KuduSchema schema;
+    ASSERT_OK(builder.Build(&schema));
+
+    // Create a table with left-unbounded range partition having the
+    // table-wide hash schema.
+    unique_ptr<KuduPartialRow> l(schema.NewRow());
+    unique_ptr<KuduPartialRow> u(schema.NewRow());
+    ASSERT_OK(u->SetInt8(kC0, 0));
+
+    unique_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
+    ASSERT_OK(table_creator->table_name(kTestTableName)
+        .schema(&schema)
+        .set_range_partition_columns({ kC0 })
+        .add_hash_partitions({ kC1 }, 2)
+        .add_range_partition(l.release(), u.release())
+        .num_replicas(FLAGS_num_replicas)
+        .Create());
+  }
+
+  string stdout;
+  string stderr;
+
+  // Add a range partition with custom hash schema using the kudu CLI tool.
+  {
+    constexpr const char* const kHashSchemaJson = R"*({
+      "hash_schema": [
+        { "columns": ["c1"], "num_buckets": 5, "seed": 8 }
+      ]
+    })*";
+    const auto s = RunKuduTool({
+      "table",
+      "add_range_partition",
+      master_addr,
+      kTestTableName,
+      "[0]",
+      "[1]",
+      Substitute("--hash_schema=$0", kHashSchemaJson),
+    }, &stdout, &stderr);
+    ASSERT_TRUE(s.ok()) << ToolRunInfo(s, stdout, stderr);
+  }
+  {
+    const auto s = RunKuduTool({
+      "table",
+      "describe",
+      master_addr,
+      kTestTableName,
+    }, &stdout, &stderr);
+    ASSERT_TRUE(s.ok()) << ToolRunInfo(s, stdout, stderr);
+    ASSERT_STR_CONTAINS(stdout,
+                        "PARTITION 0 <= VALUES < 1 HASH(c1) PARTITIONS 5");
+  }
+
+  // Insert a row into the newly added range partition.
+  {
+    client::sp::shared_ptr<KuduTable> table;
+    ASSERT_OK(client_->OpenTable(kTestTableName, &table));
+
+    auto session = client_->NewSession();
+    unique_ptr<KuduInsert> insert(table->NewInsert());
+    auto* row = insert->mutable_row();
+    ASSERT_OK(row->SetInt8(kC0, 0));
+    ASSERT_OK(row->SetInt16(kC1, 0));
+    ASSERT_OK(row->SetString(kC2, "0"));
+    ASSERT_OK(session->Apply(insert.release()));
+    ASSERT_OK(session->Flush());
+    ASSERT_EQ(1, CountTableRows(table.get()));
+  }
+
+  // Add unbounded range using the kudu CLI tool.
+  {
+    constexpr const char* const kHashSchemaJson = R"*({
+      "hash_schema": [ { "columns": ["c0", "c1"], "num_buckets": 3 } ] })*";
+    const auto s = RunKuduTool({
+      "table",
+      "add_range_partition",
+      master_addr,
+      kTestTableName,
+      "[1]",
+      "[]",
+      Substitute("--hash_schema=$0", kHashSchemaJson),
+    }, &stdout, &stderr);
+    ASSERT_TRUE(s.ok()) << ToolRunInfo(s, stdout, stderr);
+  }
+  {
+    const auto s = RunKuduTool({
+      "table",
+      "describe",
+      master_addr,
+      kTestTableName,
+    }, &stdout, &stderr);
+    ASSERT_TRUE(s.ok()) << ToolRunInfo(s, stdout, stderr);
+    ASSERT_STR_CONTAINS(stdout,
+                        "PARTITION 0 <= VALUES < 1 HASH(c1) PARTITIONS 5");
+    ASSERT_STR_CONTAINS(stdout,
+                        "PARTITION 1 <= VALUES HASH(c0, c1) PARTITIONS 3");
+  }
+
+  // Insert a row into the newly added range partition.
+  {
+    client::sp::shared_ptr<KuduTable> table;
+    ASSERT_OK(client_->OpenTable(kTestTableName, &table));
+    auto session = client_->NewSession();
+    unique_ptr<KuduInsert> insert(table->NewInsert());
+    auto* row = insert->mutable_row();
+    ASSERT_OK(row->SetInt8(kC0, 10));
+    ASSERT_OK(row->SetInt16(kC1, 10));
+    ASSERT_OK(row->SetString(kC2, "10"));
+    ASSERT_OK(session->Apply(insert.release()));
+    ASSERT_OK(session->Flush());
+    ASSERT_EQ(2, CountTableRows(table.get()));
+  }
+
+  // Drop all the ranges one-by-one.
+  const vector<pair<string, string>> kRangesStr = {
+    {"", "0"}, {"0", "1"}, {"1", ""},
+  };
+
+  for (const std::pair<string, string>& r : kRangesStr) {
+    SCOPED_TRACE(Substitute("range ['$0', '$1')", r.first, r.second));
+    const auto s = RunKuduTool({
+      "table",
+      "drop_range_partition",
+      master_addr,
+      kTestTableName,
+      Substitute("[$0]", r.first),
+      Substitute("[$0]", r.second),
+    }, &stdout, &stderr);
+    ASSERT_TRUE(s.ok()) << ToolRunInfo(s, stdout, stderr);
+  }
+
+  // There should be 0 rows left.
+  client::sp::shared_ptr<KuduTable> table;
+  ASSERT_OK(client_->OpenTable(kTestTableName, &table));
+  ASSERT_EVENTUALLY([&]() {
+    ASSERT_EQ(0, CountTableRows(table.get()));
+  });
+}
+
 namespace {
 constexpr const char* kPrincipal = "oryx";
 
@@ -3067,6 +3428,9 @@ vector<string> RebuildMasterCmd(const ExternalMiniCluster& cluster,
   };
   if (!tables.empty()) {
     command.emplace_back(Substitute("-tables=$0", tables));
+  }
+  if (Env::Default()->IsEncryptionEnabled()) {
+    command.emplace_back("--encrypt_data_at_rest=true");
   }
   if (log_to_stderr) {
     command.emplace_back("--logtostderr");

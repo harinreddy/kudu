@@ -27,6 +27,7 @@
 #include <ostream>
 #include <random>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -55,9 +56,7 @@
 #include "kudu/master/master.proxy.h"
 #include "kudu/master/txn_manager.proxy.h"
 #include "kudu/rpc/connection.h"
-#include "kudu/rpc/messenger.h"
 #include "kudu/rpc/request_tracker.h"
-#include "kudu/rpc/response_callback.h"
 #include "kudu/rpc/rpc.h"
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/security/cert.h"
@@ -99,6 +98,8 @@ using kudu::master::ListTabletServersRequestPB;
 using kudu::master::ListTabletServersResponsePB;
 using kudu::master::MasterFeatures;
 using kudu::master::MasterServiceProxy;
+using kudu::master::RecallDeletedTableRequestPB;
+using kudu::master::RecallDeletedTableResponsePB;
 using kudu::master::TableIdentifierPB;
 using kudu::rpc::BackoffType;
 using kudu::rpc::CredentialsPolicy;
@@ -312,6 +313,7 @@ Status KuduClient::Data::GetTabletServer(KuduClient* client,
   return Status::OK();
 }
 
+// TODO(yingchun): Add has_immutable_column_schema
 Status KuduClient::Data::CreateTable(KuduClient* client,
                                      const CreateTableRequestPB& req,
                                      CreateTableResponsePB* resp,
@@ -373,16 +375,38 @@ Status KuduClient::Data::WaitForCreateTableToFinish(
 Status KuduClient::Data::DeleteTable(KuduClient* client,
                                      const string& table_name,
                                      const MonoTime& deadline,
-                                     bool modify_external_catalogs) {
+                                     bool modify_external_catalogs,
+                                     uint32_t reserve_seconds) {
   DeleteTableRequestPB req;
   DeleteTableResponsePB resp;
 
   req.mutable_table()->set_table_name(table_name);
   req.set_modify_external_catalogs(modify_external_catalogs);
+  req.set_reserve_seconds(reserve_seconds);
   Synchronizer sync;
   AsyncLeaderMasterRpc<DeleteTableRequestPB, DeleteTableResponsePB> rpc(
       deadline, client, BackoffType::EXPONENTIAL, req, &resp,
       &MasterServiceProxy::DeleteTableAsync, "DeleteTable", sync.AsStatusCallback(), {});
+  rpc.SendRpc();
+  return sync.Wait();
+}
+
+Status KuduClient::Data::RecallTable(KuduClient* client,
+                                     const std::string& table_id,
+                                     const MonoTime& deadline,
+                                     const std::string& new_table_name) {
+  RecallDeletedTableRequestPB req;
+  RecallDeletedTableResponsePB resp;
+
+  req.mutable_table()->set_table_id(table_id);
+  if (!new_table_name.empty()) {
+    req.set_new_table_name(new_table_name);
+  }
+  Synchronizer sync;
+  AsyncLeaderMasterRpc<RecallDeletedTableRequestPB, RecallDeletedTableResponsePB> rpc(
+      deadline, client, BackoffType::EXPONENTIAL, req, &resp,
+      &MasterServiceProxy::RecallDeletedTableAsync, "RecallDeletedTable", sync.AsStatusCallback(),
+      {});
   rpc.SendRpc();
   return sync.Wait();
 }
@@ -444,11 +468,15 @@ Status KuduClient::Data::WaitForAlterTableToFinish(
 
 Status KuduClient::Data::ListTablesWithInfo(KuduClient* client,
                                             vector<TableInfo>* tables_info,
-                                            const string& filter) {
+                                            const string& filter,
+                                            bool list_tablet_with_partition,
+                                            bool show_soft_deleted) {
   ListTablesRequestPB req;
   if (!filter.empty()) {
     req.set_name_filter(filter);
   }
+  req.set_show_soft_deleted(show_soft_deleted);
+  req.set_list_tablet_with_partition(list_tablet_with_partition);
 
   auto deadline = MonoTime::Now() + client->default_admin_operation_timeout();
   Synchronizer sync;
@@ -468,8 +496,26 @@ Status KuduClient::Data::ListTablesWithInfo(KuduClient* client,
     info.live_row_count = table.has_live_row_count() ? table.live_row_count() : 0;
     info.num_tablets = table.has_num_tablets() ? table.num_tablets() : 0;
     info.num_replicas = table.has_num_replicas() ? table.num_replicas() : 0;
+    if (list_tablet_with_partition) {
+      for (const auto& pt : table.tablet_with_partition()) {
+        Partition partition;
+        Partition::FromPB(pt.partition(), &partition);
+        PartitionWithTabletId partition_with_tablet_id = {pt.tablet_id(), std::move(partition)};
+        info.partition_with_tablet_info.emplace_back(std::move(partition_with_tablet_id));
+      }
+    }
+
+    // sort by range key
+    // Different range partitions of the same table do not intersect.
+    // So we just compare the start/begin key of two ranges.
+    std::sort(info.partition_with_tablet_info.begin(), info.partition_with_tablet_info.end(),
+              [] (const PartitionWithTabletId& lhs, const PartitionWithTabletId& rhs) {
+      return lhs.partition.begin().range_key() < rhs.partition.begin().range_key();
+    });
+
     tables_info->emplace_back(std::move(info));
   }
+
   return Status::OK();
 }
 

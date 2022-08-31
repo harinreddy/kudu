@@ -21,6 +21,7 @@
 #include <optional>
 #include <ostream>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -102,9 +103,15 @@ TAG_FLAG(master_support_change_config, advanced);
 TAG_FLAG(master_support_change_config, runtime);
 
 DEFINE_bool(master_support_ignore_operations, true,
-            "Whether the cluster supports support ignore operations.");
+            "Whether the cluster supports ignore operations, including "
+            "INSERT_IGNORE, DELETE_IGNORE and UPDATE_IGNORE).");
 TAG_FLAG(master_support_ignore_operations, hidden);
 TAG_FLAG(master_support_ignore_operations, runtime);
+
+DEFINE_bool(master_support_upsert_ignore_operations, true,
+            "Whether the cluster supports UPSERT_IGNORE operations.");
+TAG_FLAG(master_support_upsert_ignore_operations, hidden);
+TAG_FLAG(master_support_upsert_ignore_operations, runtime);
 
 
 using google::protobuf::Message;
@@ -565,7 +572,30 @@ void MasterServiceImpl::DeleteTable(const DeleteTableRequestPB* req,
     return;
   }
 
-  Status s = server_->catalog_manager()->DeleteTableRpc(*req, resp, rpc);
+  Status s = server_->catalog_manager()->SoftDeleteTableRpc(*req, resp, rpc);
+  CheckRespErrorOrSetUnknown(s, resp);
+  rpc->RespondSuccess();
+}
+
+void MasterServiceImpl::RecallDeletedTable(const RecallDeletedTableRequestPB* req,
+                                           RecallDeletedTableResponsePB* resp,
+                                           rpc::RpcContext* rpc) {
+  CatalogManager::ScopedLeaderSharedLock l(server_->catalog_manager());
+  if (!l.CheckIsInitializedAndIsLeaderOrRespond(resp, rpc)) {
+    return;
+  }
+
+  // Soft-delete related functions is not supported when HMS is enabled.
+  if (hms::HmsCatalog::IsEnabled()) {
+    StatusToPB(Status::NotSupported("RecallDeletedTable is not supported when HMS is enabled."),
+               resp->mutable_error()->mutable_status());
+    resp->mutable_error()->set_code(MasterErrorPB::UNKNOWN_ERROR);
+    rpc->RespondSuccess();
+    return;
+  }
+
+  Status s = server_->catalog_manager()->RecallDeletedTableRpc(
+             *req, resp, rpc);
   CheckRespErrorOrSetUnknown(s, resp);
   rpc->RespondSuccess();
 }
@@ -886,6 +916,8 @@ bool MasterServiceImpl::SupportsFeature(uint32_t feature) const {
       return FLAGS_master_support_ignore_operations;
     case MasterFeatures::RANGE_SPECIFIC_HASH_SCHEMA:
       return FLAGS_enable_per_range_hash_schemas;
+    case MasterFeatures::UPSERT_IGNORE:
+      return FLAGS_master_support_upsert_ignore_operations;
     default:
       return false;
   }
