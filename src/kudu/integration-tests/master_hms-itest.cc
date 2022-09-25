@@ -16,6 +16,7 @@
 // under the License.
 
 #include <algorithm>
+#include <fstream>
 #include <functional>
 #include <initializer_list>
 #include <map>
@@ -40,6 +41,7 @@
 #include "kudu/hms/hive_metastore_types.h"
 #include "kudu/hms/hms_catalog.h"
 #include "kudu/hms/hms_client.h"
+#include "kudu/hms/mini_hms.h"
 #include "kudu/integration-tests/external_mini_cluster-itest-base.h"
 #include "kudu/integration-tests/hms_itest-base.h"
 #include "kudu/mini-cluster/external_mini_cluster.h"
@@ -83,8 +85,8 @@ class MasterHmsTest : public ExternalMiniClusterITestBase {
     opts.principal = Principal();
     // Tune down the notification log poll period in order to speed up catalog convergence.
     opts.extra_master_flags.emplace_back("--hive_metastore_notification_log_poll_period_seconds=1");
+    SetFlags(&opts);
     StartClusterWithOpts(std::move(opts));
-
     thrift::ClientOptions hms_opts;
     hms_opts.enable_kerberos = EnableKerberos();
     hms_opts.service_principal = "hive";
@@ -180,6 +182,8 @@ class MasterHmsTest : public ExternalMiniClusterITestBase {
   virtual string Principal() {
     return "kudu";
   }
+
+  virtual void SetFlags(ExternalMiniClusterOptions* opts) const {}
 };
 
 TEST_F(MasterHmsTest, TestCreateTable) {
@@ -481,15 +485,18 @@ TEST_F(MasterHmsTest, TestDeleteTable) {
   ASSERT_OK(harness_.hms_client()->DropTable("default", "externalTable"));
 }
 
-TEST_F(MasterHmsTest, TestSoftDeleteTable) {
+// Test to verify that the soft-deletion of tables is not supported when
+// HMS is enabled.
+TEST_F(MasterHmsTest, TableSoftDeleteNotSupportedWithHmsEnabled) {
   // TODO(kedeng) : change the test case when state sync to HMS
   // Create a Kudu table, then soft delete it from Kudu.
   ASSERT_OK(CreateKuduTable("default", "a"));
   NO_FATALS(CheckTable("default", "a", /*user=*/ nullopt));
   hive::Table hms_table;
-  // Soft-delete related functions is not supported when HMS is enabled.
-  // We set hive_metastore_uris for hack HMS enable.
-  FLAGS_hive_metastore_uris = "thrift://127.0.0.1:0";
+  // Set --hive_metastore_uris to make HmsCatalog::IsEnabled() returns 'true'.
+  const auto& hms_uris = cluster_->hms()->uris();
+  ASSERT_TRUE(!hms_uris.empty());
+  FLAGS_hive_metastore_uris = hms_uris;
   ASSERT_TRUE(hms::HmsCatalog::IsEnabled());
   Status s = client_->SoftDeleteTable("default.a", 6000);
   ASSERT_TRUE(s.IsNotSupported()) << s.ToString();
@@ -501,6 +508,30 @@ TEST_F(MasterHmsTest, TestSoftDeleteTable) {
   // The table is remain in the Kudu cluster.
   shared_ptr<KuduTable> table;
   ASSERT_OK(client_->OpenTable("default.a", &table));
+}
+
+// This test makes sure that with the HMS integration enabled, both alter and
+// drop/delete for a table work as expected after the soft-delete feature for
+// tables has been introduced. There might be other scenarios elsewhere testing
+// for that implicitly, but this scenario is run explicitly to check for the
+// backward compatibility in that context.
+TEST_F(MasterHmsTest, AlterAndDeleteTableWhenHmsEnabled) {
+  // Create the database and Kudu table.
+  ASSERT_OK(CreateDatabase("db"));
+  ASSERT_OK(CreateKuduTable("db", "a"));
+  NO_FATALS(CheckTable("db", "a", /*user=*/nullopt));
+
+  const auto& hms_uris = cluster_->hms()->uris();
+  ASSERT_TRUE(!hms_uris.empty());
+  // Set --hive_metastore_uris to make HmsCatalog::IsEnabled() returns 'true'.
+  FLAGS_hive_metastore_uris = hms_uris;
+  ASSERT_TRUE(hms::HmsCatalog::IsEnabled());
+
+  unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer("db.a"));
+  ASSERT_OK(table_alterer->RenameTo("db.b")->Alter());
+
+  ASSERT_OK(client_->DeleteTable("db.b"));
+  NO_FATALS(CheckTableDoesNotExist("db", "b"));
 }
 
 TEST_F(MasterHmsTest, TestNotificationLogListener) {
@@ -849,5 +880,47 @@ TEST_F(MasterHmsKerberizedTest, TestTableOwnership) {
   hive::Table table;
   ASSERT_OK(harness_.hms_client()->GetTable("default", "my_table", &table));
   ASSERT_EQ("test-user", table.owner);
+}
+
+class MasterHmsDBTest : public MasterHmsTest {
+ public:
+  void SetFlags(ExternalMiniClusterOptions* opts) const override {
+    opts->extra_master_flags.emplace_back("--logtostderr=false");
+  }
+};
+
+// TODO(achennaka): Skip test until server timeouts seen in ASAN builds are resolved.
+TEST_F(MasterHmsDBTest, DISABLED_TestHMSDBErase) {
+  // Generate 2 HMS events. With just one event created the published
+  // event id is not 0 after the database drop.
+  ASSERT_OK(CreateKuduTable("default", "a"));
+  unique_ptr<KuduTableAlterer> table_alterer;
+  table_alterer.reset(client_->NewTableAlterer("default.a")->RenameTo("default.b"));
+  ASSERT_OK(table_alterer->Alter());
+
+  // Ensure the table is present in HMS database.
+  NO_FATALS(CheckTable("default", "b", /*user=*/ nullopt));
+
+  // Simulate accidental HMS database loss.
+  ASSERT_OK(StopHms());
+  ASSERT_OK(cluster_->hms()->DeleteDatabaseDir());
+  ASSERT_OK(StartHms());
+
+  // Now everytime we poll HMS for new events, we should be logging an error message.
+  constexpr const char* const str = "The event ID 2 last seen by Kudu master is greater "
+                                    "than 0 currently reported by HMS. Has the HMS database "
+                                    "been reset (backup&restore, etc.)?";
+  ASSERT_EVENTUALLY([&] {
+    string line;
+    bool log_found = false;
+    std::ifstream in(strings::Substitute("$0/kudu-master.ERROR", cluster_->master()->log_dir()));
+    while (std::getline(in, line)) {
+      if (line.find(str) != std::string::npos) {
+        log_found = true;
+        break;
+      }
+    }
+    ASSERT_TRUE(log_found);
+  });
 }
 } // namespace kudu

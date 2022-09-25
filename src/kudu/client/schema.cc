@@ -47,6 +47,9 @@ DEFINE_bool(show_attributes, false,
             "Whether to show column attributes, including column encoding type, "
             "compression type, and default read/write value.");
 
+DEFINE_bool(show_column_comment, false,
+            "Whether to show column comment.");
+
 MAKE_ENUM_LIMITS(kudu::client::KuduColumnStorageAttributes::EncodingType,
                  kudu::client::KuduColumnStorageAttributes::AUTO_ENCODING,
                  kudu::client::KuduColumnStorageAttributes::RLE);
@@ -345,6 +348,16 @@ KuduColumnSpec* KuduColumnSpec::Nullable() {
   return this;
 }
 
+KuduColumnSpec* KuduColumnSpec::Immutable() {
+  data_->immutable = true;
+  return this;
+}
+
+KuduColumnSpec* KuduColumnSpec::Mutable() {
+  data_->immutable = false;
+  return this;
+}
+
 KuduColumnSpec* KuduColumnSpec::RemoveDefault() {
   data_->remove_default = true;
   return this;
@@ -453,6 +466,7 @@ Status KuduColumnSpec::ToColumnSchema(KuduColumnSchema* col) const {
   KuduColumnTypeAttributes type_attrs(precision, scale, length);
   DataType internal_type = ToInternalDataType(data_->type.value(), type_attrs);
   bool nullable = data_->nullable ? data_->nullable.value() : true;
+  bool immutable = data_->immutable ? data_->immutable.value() : false;
 
   void* default_val = nullptr;
   // TODO(unknown): distinguish between DEFAULT NULL and no default?
@@ -474,7 +488,7 @@ Status KuduColumnSpec::ToColumnSchema(KuduColumnSchema* col) const {
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
   *col = KuduColumnSchema(data_->name, data_->type.value(), nullable,
-                          default_val,
+                          immutable, default_val,
                           KuduColumnStorageAttributes(encoding, compression, block_size),
                           type_attrs,
                           data_->comment ? data_->comment.value() : "");
@@ -512,6 +526,10 @@ Status KuduColumnSpec::ToColumnSchemaDelta(ColumnSchemaDelta* col_delta) const {
 
   if (data_->compression) {
     col_delta->compression = ToInternalCompressionType(data_->compression.value());
+  }
+
+  if (data_->immutable) {
+    col_delta->immutable = data_->immutable.value();
   }
 
   col_delta->new_name = std::move(data_->rename_to);
@@ -732,6 +750,7 @@ string KuduColumnSchema::DataTypeToString(DataType type) {
 KuduColumnSchema::KuduColumnSchema(const string &name,
                                    DataType type,
                                    bool is_nullable,
+                                   bool is_immutable,
                                    const void* default_value,
                                    const KuduColumnStorageAttributes& storage_attributes,
                                    const KuduColumnTypeAttributes& type_attributes,
@@ -746,7 +765,7 @@ KuduColumnSchema::KuduColumnSchema(const string &name,
   type_attr_private.length = type_attributes.length();
   col_ = new ColumnSchema(name, ToInternalDataType(type, type_attributes),
                           is_nullable,
-                          false,   // TODO(yingchun): set according to a new added parameter later
+                          is_immutable,
                           default_value, default_value, attr_private,
                           type_attr_private, comment);
 }
@@ -798,6 +817,10 @@ const string& KuduColumnSchema::name() const {
 
 bool KuduColumnSchema::is_nullable() const {
   return DCHECK_NOTNULL(col_)->is_nullable();
+}
+
+bool KuduColumnSchema::is_immutable() const {
+  return DCHECK_NOTNULL(col_)->is_immutable();
 }
 
 KuduColumnSchema::DataType KuduColumnSchema::type() const {
@@ -901,7 +924,7 @@ KuduColumnSchema KuduSchema::Column(size_t idx) const {
   KuduColumnTypeAttributes type_attrs(col.type_attributes().precision, col.type_attributes().scale,
                                       col.type_attributes().length);
   return KuduColumnSchema(col.name(), FromInternalDataType(col.type_info()->type()),
-                          col.is_nullable(), col.read_default_value(),
+                          col.is_nullable(), col.is_immutable(), col.read_default_value(),
                           attrs, type_attrs, col.comment());
 }
 
@@ -935,10 +958,17 @@ void KuduSchema::GetPrimaryKeyColumnIndexes(vector<int>* indexes) const {
 }
 
 string KuduSchema::ToString() const {
-  return schema_ ? schema_->ToString(FLAGS_show_attributes ?
-                                     Schema::ToStringMode::WITH_COLUMN_ATTRIBUTES
-                                     : Schema::ToStringMode::BASE_INFO)
-                 : "()";
+  if (!schema_) {
+    return "()";
+  }
+  uint8_t mode = Schema::ToStringMode::BASE_INFO;
+  if (FLAGS_show_attributes) {
+    mode |= Schema::ToStringMode::WITH_COLUMN_ATTRIBUTES;
+  }
+  if (FLAGS_show_column_comment) {
+    mode |= Schema::ToStringMode::WITH_COLUMN_COMMENTS;
+  }
+  return schema_->ToString(mode);
 }
 
 KuduSchema KuduSchema::FromSchema(const Schema& schema) {

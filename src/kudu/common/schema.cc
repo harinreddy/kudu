@@ -153,14 +153,20 @@ Status ColumnSchema::ApplyDelta(const ColumnSchemaDelta& col_delta) {
   if (col_delta.new_comment) {
     comment_ = col_delta.new_comment.value();
   }
+  if (col_delta.immutable) {
+    is_immutable_ = col_delta.immutable.value();
+  }
   return Status::OK();
 }
 
-string ColumnSchema::ToString(ToStringMode mode) const {
-  return Substitute("$0 $1$2",
+string ColumnSchema::ToString(uint8_t mode) const {
+  return Substitute("$0 $1$2$3",
                     name_,
                     TypeToString(),
-                    mode == ToStringMode::WITH_ATTRIBUTES ? " " + AttrToString() : "");
+                    mode & ToStringMode::WITH_ATTRIBUTES ?
+                    " " + AttrToString() : "",
+                    mode & ToStringMode::WITH_COMMENTS
+                    && comment_.length() ? " " + comment_ : "");
 }
 
 string ColumnSchema::TypeToString() const {
@@ -456,7 +462,7 @@ Status Schema::GetMappedReadProjection(const Schema& projection,
   return Status::OK();
 }
 
-string Schema::ToString(ToStringMode mode) const {
+string Schema::ToString(uint8_t mode) const {
   if (cols_.empty()) return "()";
 
   vector<string> pk_strs;
@@ -465,12 +471,15 @@ string Schema::ToString(ToStringMode mode) const {
     pk_strs.push_back(cols_[i].name());
   }
 
-  auto col_mode = ColumnSchema::ToStringMode::WITHOUT_ATTRIBUTES;
+  uint8_t col_mode = ColumnSchema::ToStringMode::WITHOUT_ATTRIBUTES;
   if (mode & ToStringMode::WITH_COLUMN_ATTRIBUTES) {
-    col_mode = ColumnSchema::ToStringMode::WITH_ATTRIBUTES;
+    col_mode |= ColumnSchema::ToStringMode::WITH_ATTRIBUTES;
+  }
+  if (mode & ToStringMode::WITH_COLUMN_COMMENTS) {
+    col_mode |= ColumnSchema::ToStringMode::WITH_COMMENTS;
   }
   vector<string> col_strs;
-  if (has_column_ids() && (mode & ToStringMode::WITH_COLUMN_IDS)) {
+  if (has_column_ids() && mode & ToStringMode::WITH_COLUMN_IDS) {
     for (size_t i = 0; i < cols_.size(); ++i) {
       col_strs.push_back(Substitute("$0:$1", col_ids_[i], cols_[i].ToString(col_mode)));
     }

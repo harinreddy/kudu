@@ -1661,7 +1661,7 @@ TEST_F(AdminCliTest, TestDeleteTable) {
   ASSERT_TRUE(tables.empty());
 }
 
-TEST_F(AdminCliTest, TestListTables) {
+TEST_F(AdminCliTest, TestListSoftDeletedTables) {
   FLAGS_num_tablet_servers = 1;
   FLAGS_num_replicas = 1;
 
@@ -1669,15 +1669,14 @@ TEST_F(AdminCliTest, TestListTables) {
 
   {
     string stdout;
-    ASSERT_OK(RunKuduTool({
+    string stderr;
+    Status s = RunKuduTool({
       "table",
       "list",
-      cluster_->master()->bound_rpc_addr().ToString()
-    }, &stdout));
-
-    vector<string> stdout_lines = Split(stdout, ",", strings::SkipEmpty());
-    ASSERT_EQ(1, stdout_lines.size());
-    ASSERT_EQ(Substitute("$0\n", kTableId), stdout_lines[0]);
+      cluster_->master()->bound_rpc_addr().ToString(),
+    }, &stdout, &stderr);
+    ASSERT_TRUE(s.ok()) << ToolRunInfo(s, stdout, stderr);
+    ASSERT_STR_CONTAINS(stdout, kTableId);
   }
 
   {
@@ -1690,31 +1689,80 @@ TEST_F(AdminCliTest, TestListTables) {
     }, &stdout));
 
     vector<string> stdout_lines = Split(stdout, ",", strings::SkipEmpty());
-    ASSERT_EQ(0, stdout_lines.size());
+    ASSERT_EQ(1, stdout_lines.size());
+    ASSERT_EQ("\n", stdout_lines[0]);
 
     ASSERT_OK(RunKuduTool({
       "table",
       "delete",
+      "--reserve_seconds=300",
       cluster_->master()->bound_rpc_addr().ToString(),
       kTableId
     }, &stdout));
 
     stdout.clear();
-    ASSERT_OK(RunKuduTool({
+    string stderr;
+    Status s = RunKuduTool({
       "table",
       "list",
       "-soft_deleted_only=true",
-      cluster_->master()->bound_rpc_addr().ToString()
-    }, &stdout));
-
-    stdout_lines.clear();
-    stdout_lines = Split(stdout, ",", strings::SkipEmpty());
-    ASSERT_EQ(1, stdout_lines.size());
-    ASSERT_EQ(Substitute("$0\n", kTableId), stdout_lines[0]);
+      cluster_->master()->bound_rpc_addr().ToString(),
+    }, &stdout, &stderr);
+    ASSERT_TRUE(s.ok()) << ToolRunInfo(s, stdout, stderr);
+    ASSERT_STR_CONTAINS(stdout, kTableId);
   }
 }
 
-TEST_F(AdminCliTest, TestListTablesDetail) {
+static vector<string> TableListFormat() {
+  return { "pretty", "json", "json_compact" };
+}
+
+class ListTableCliSimpleParamTest :
+    public AdminCliTest,
+    public ::testing::WithParamInterface<string> {
+};
+
+INSTANTIATE_TEST_SUITE_P(, ListTableCliSimpleParamTest,
+                         ::testing::ValuesIn(TableListFormat()));
+
+TEST_P(ListTableCliSimpleParamTest, TestListTables) {
+  FLAGS_num_tablet_servers = 1;
+  FLAGS_num_replicas = 1;
+
+  NO_FATALS(BuildAndStart());
+
+  string stdout;
+  string stderr;
+  Status s = RunKuduTool({
+    "table",
+    "list",
+    Substitute("--list_table_output_format=$0", GetParam()),
+    cluster_->master()->bound_rpc_addr().ToString(),
+  }, &stdout, &stderr);
+  ASSERT_TRUE(s.ok()) << ToolRunInfo(s, stdout, stderr);
+
+  if (GetParam() == "pretty") {
+    vector<string> stdout_lines = Split(stdout, ",", strings::SkipEmpty());
+    ASSERT_EQ(1, stdout_lines.size());
+    ASSERT_STR_CONTAINS(stdout, Substitute("$0\n", kTableId));
+  } else if (GetParam() == "json") {
+    ASSERT_STR_CONTAINS(stdout, Substitute("\"name\": \"$0\"", kTableId));
+  } else if (GetParam() == "json_compact") {
+    ASSERT_STR_CONTAINS(stdout, Substitute("\"name\":\"$0\"", kTableId));
+  } else {
+    FAIL() << "unexpected table list format" << GetParam();
+  }
+}
+
+class ListTableCliDetailParamTest :
+    public AdminCliTest,
+    public ::testing::WithParamInterface<string> {
+};
+
+INSTANTIATE_TEST_SUITE_P(, ListTableCliDetailParamTest,
+                         ::testing::ValuesIn(TableListFormat()));
+
+TEST_P(ListTableCliDetailParamTest, TestListTablesDetail) {
   FLAGS_num_tablet_servers = 3;
   FLAGS_num_replicas = 3;
 
@@ -1738,25 +1786,53 @@ TEST_F(AdminCliTest, TestListTablesDetail) {
                        MonoDelta::FromSeconds(30), &tablet_ids);
 
   string stdout;
-  ASSERT_OK(RunKuduTool({
+  string stderr;
+  Status s = RunKuduTool({
     "table",
     "list",
     "--list_tablets",
-    cluster_->master()->bound_rpc_addr().ToString()
-  }, &stdout));
+    Substitute("--list_table_output_format=$0", GetParam()),
+    cluster_->master()->bound_rpc_addr().ToString(),
+  }, &stdout, &stderr);
+  ASSERT_TRUE(s.ok()) << ToolRunInfo(s, stdout, stderr);
 
-  vector<string> stdout_lines = Split(stdout, "\n", strings::SkipEmpty());
+  if (GetParam() == "pretty") {
+    vector<string> stdout_lines = Split(stdout, "\n", strings::SkipEmpty());
 
-  // Verify multiple tables along with their tablets and replica-uuids.
-  ASSERT_EQ(10, stdout_lines.size());
-  ASSERT_STR_CONTAINS(stdout, kTableId);
-  ASSERT_STR_CONTAINS(stdout, kAnotherTableId);
-  ASSERT_STR_CONTAINS(stdout, tablet_ids.front());
-  ASSERT_STR_CONTAINS(stdout, tablet_ids.back());
+    // Verify multiple tables along with their tablets and replica-uuids.
+    ASSERT_STR_CONTAINS(stdout, kTableId);
+    ASSERT_STR_CONTAINS(stdout, kAnotherTableId);
+    ASSERT_STR_CONTAINS(stdout, tablet_ids.front());
+    ASSERT_STR_CONTAINS(stdout, tablet_ids.back());
 
-  for (auto& ts : tservers) {
-    ASSERT_STR_CONTAINS(stdout, ts->uuid());
-    ASSERT_STR_CONTAINS(stdout, ts->uuid());
+    for (auto& ts : tservers) {
+      ASSERT_STR_CONTAINS(stdout, ts->uuid());
+      ASSERT_STR_CONTAINS(stdout, ts->uuid());
+    }
+  } else if (GetParam() == "json") {
+    // The 'json' format output should contain the table id for the table.
+    ASSERT_STR_CONTAINS(stdout, Substitute("\"name\": \"$0\"", kTableId));
+    ASSERT_STR_CONTAINS(stdout, Substitute("\"name\": \"$0\"", kAnotherTableId));
+    for (auto& tablet_id : tablet_ids) {
+      ASSERT_STR_CONTAINS(stdout, Substitute("\"tablet_id\": \"$0\"", tablet_id));
+    }
+
+    for (auto& ts : tservers) {
+      ASSERT_STR_CONTAINS(stdout, Substitute("\"uuid\": \"$0\"", ts->uuid()));
+    }
+  } else if (GetParam() == "json_compact") {
+    // The 'json_compact' format output should contain the table id for the table.
+    ASSERT_STR_CONTAINS(stdout, Substitute("\"name\":\"$0\"", kTableId));
+    ASSERT_STR_CONTAINS(stdout, Substitute("\"name\":\"$0\"", kAnotherTableId));
+    for (auto& tablet_id : tablet_ids) {
+      ASSERT_STR_CONTAINS(stdout, Substitute("\"tablet_id\":\"$0\"", tablet_id));
+    }
+
+    for (auto& ts : tservers) {
+      ASSERT_STR_CONTAINS(stdout, Substitute("\"uuid\":\"$0\"", ts->uuid()));
+    }
+  } else {
+    FAIL() << "unexpected table list format" << GetParam();
   }
 }
 
@@ -1838,7 +1914,8 @@ TEST_F(AdminCliTest, TestDescribeTable) {
     builder.AddColumn("date_val")->Type(KuduColumnSchema::DATE);
     builder.AddColumn("string_val")->Type(KuduColumnSchema::STRING)
       ->Encoding(KuduColumnStorageAttributes::EncodingType::PREFIX_ENCODING)
-      ->Default(KuduValue::CopyString(Slice("hello")));
+      ->Default(KuduValue::CopyString(Slice("hello")))
+      ->Comment("comment for hello");
     builder.AddColumn("bool_val")->Type(KuduColumnSchema::BOOL)
       ->Default(KuduValue::FromBool(false));
     builder.AddColumn("float_val")->Type(KuduColumnSchema::FLOAT);
@@ -1926,7 +2003,8 @@ TEST_F(AdminCliTest, TestDescribeTable) {
     "describe",
     cluster_->master()->bound_rpc_addr().ToString(),
     kAnotherTableId,
-    "-show_attributes=true"
+    "-show_attributes=true",
+    "-show_column_comment=true"
   }, &stdout, &stderr);
   ASSERT_TRUE(s.ok()) << ToolRunInfo(s, stdout, stderr);
 
@@ -1943,7 +2021,8 @@ TEST_F(AdminCliTest, TestDescribeTable) {
       "    int64_val INT64 NULLABLE AUTO_ENCODING ZLIB 123 123,\n"
       "    timestamp_val UNIXTIME_MICROS NULLABLE AUTO_ENCODING DEFAULT_COMPRESSION - -,\n"
       "    date_val DATE NULLABLE AUTO_ENCODING DEFAULT_COMPRESSION - -,\n"
-      "    string_val STRING NULLABLE PREFIX_ENCODING DEFAULT_COMPRESSION \"hello\" \"hello\",\n"
+      "    string_val STRING NULLABLE PREFIX_ENCODING DEFAULT_COMPRESSION \"hello\" \"hello\" "
+      "comment for hello,\n"
       "    bool_val BOOL NULLABLE AUTO_ENCODING DEFAULT_COMPRESSION false false,\n"
       "    float_val FLOAT NULLABLE AUTO_ENCODING DEFAULT_COMPRESSION - -,\n"
       "    double_val DOUBLE NULLABLE AUTO_ENCODING DEFAULT_COMPRESSION 123.4 123.4,\n"
@@ -2093,6 +2172,77 @@ TEST_F(AdminCliTest, TestDescribeTable) {
   );
 }
 
+// Simple tests to check whether the column describing flags
+// work, alone and together as well.
+TEST_F(AdminCliTest, TestDescribeTableColumnFlags) {
+
+  NO_FATALS(BuildAndStart());
+  string stdout;
+  const string kTableName = "TestAnotherTable";
+
+  {
+    // Build the schema
+    KuduSchema schema;
+    KuduSchemaBuilder builder;
+    builder.AddColumn("foo")->Type(KuduColumnSchema::INT32)->NotNull();
+    builder.AddColumn("bar")->Type(KuduColumnSchema::INT32)->NotNull()
+        ->Comment("comment for bar");
+    builder.SetPrimaryKey({"foo"});
+    ASSERT_OK(builder.Build(&schema));
+
+    // Create the table
+    unique_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
+    ASSERT_OK(table_creator->table_name(kTableName)
+                  .schema(&schema)
+                  .set_range_partition_columns({"foo"})
+                  .Create());
+  }
+
+  // Test the describe output with flags
+  ASSERT_OK(RunKuduTool({"table",
+                         "describe",
+                         cluster_->master()->bound_rpc_addr().ToString(),
+                         kTableName,
+                         "-show_column_comment"},
+                        &stdout));
+  ASSERT_STR_CONTAINS(stdout,
+                      "(\n"
+                      "    foo INT32 NOT NULL,\n"
+                      "    bar INT32 NOT NULL comment for bar,\n"
+                      "    PRIMARY KEY (foo)\n"
+                      ")\n");
+  stdout.clear();
+
+  ASSERT_OK(RunKuduTool({"table",
+                         "describe",
+                         cluster_->master()->bound_rpc_addr().ToString(),
+                         kTableName,
+                         "-show_attributes"},
+                        &stdout));
+  ASSERT_STR_CONTAINS(stdout,
+                      "(\n"
+                      "    foo INT32 NOT NULL AUTO_ENCODING DEFAULT_COMPRESSION - -,\n"
+                      "    bar INT32 NOT NULL AUTO_ENCODING DEFAULT_COMPRESSION - -,\n"
+                      "    PRIMARY KEY (foo)\n"
+                      ")\n");
+  stdout.clear();
+
+  ASSERT_OK(RunKuduTool({"table",
+                         "describe",
+                         cluster_->master()->bound_rpc_addr().ToString(),
+                         kTableName,
+                         "-show_attributes",
+                         "-show_column_comment"},
+                        &stdout));
+  ASSERT_STR_CONTAINS(
+      stdout,
+      "(\n"
+      "    foo INT32 NOT NULL AUTO_ENCODING DEFAULT_COMPRESSION - -,\n"
+      "    bar INT32 NOT NULL AUTO_ENCODING DEFAULT_COMPRESSION - - comment for bar,\n"
+      "    PRIMARY KEY (foo)\n"
+      ")\n");
+}
+
 TEST_F(AdminCliTest, TestDescribeTableNoOwner) {
   NO_FATALS(BuildAndStart({}, {"--allow_empty_owner=true"}));
   KuduSchema schema;
@@ -2180,15 +2330,32 @@ TEST_F(AdminCliTest, TestDescribeTableCustomHashSchema) {
                               "    PARTITION 100 <= VALUES < 200");
 }
 
-class ListTableCliParamTest : public AdminCliTest,
-                              public ::testing::WithParamInterface<bool> {
+class ListTableCliParamTest :
+    public AdminCliTest,
+    public ::testing::WithParamInterface<tuple<bool /* show_tablet_partition_info*/,
+                                               bool /* show_hash_partition_info*/,
+                                               string /* output format*/>> {
 };
+
+INSTANTIATE_TEST_SUITE_P(, ListTableCliParamTest,
+    ::testing::Combine(::testing::Bool(),
+                       ::testing::Bool(),
+                       ::testing::ValuesIn(TableListFormat())));
 
 // Basic test that the kudu tool works in the list tablets case.
 TEST_P(ListTableCliParamTest, ListTabletWithPartitionInfo) {
-  const auto show_hp = GetParam() ? PartitionSchema::HashPartitionInfo::SHOW
-                                  : PartitionSchema::HashPartitionInfo::HIDE;
+  const auto show_tp = std::get<0>(GetParam()) ? PartitionSchema::HashPartitionInfo::SHOW :
+      PartitionSchema::HashPartitionInfo::HIDE;
+  const auto show_hp = std::get<1>(GetParam()) ? PartitionSchema::HashPartitionInfo::SHOW :
+      PartitionSchema::HashPartitionInfo::HIDE;
   const auto kTimeout = MonoDelta::FromSeconds(30);
+
+  // This combination of parameters does not meet expectations.
+  if (show_tp == PartitionSchema::HashPartitionInfo::HIDE &&
+      show_hp == PartitionSchema::HashPartitionInfo::SHOW) {
+    return;
+  }
+
   FLAGS_num_tablet_servers = 1;
   FLAGS_num_replicas = 1;
 
@@ -2254,8 +2421,9 @@ TEST_P(ListTableCliParamTest, ListTabletWithPartitionInfo) {
     "table",
     "list",
     "--list_tablets",
-    "--show_tablet_partition_info",
-    Substitute("--show_hash_partition_info=$0", GetParam()),
+    Substitute("--show_tablet_partition_info=$0", std::get<0>(GetParam())),
+    Substitute("--show_hash_partition_info=$0", std::get<1>(GetParam())),
+    Substitute("--list_table_output_format=$0", std::get<2>(GetParam())),
     "--tables",
     kTableName,
     cluster_->master()->bound_rpc_addr().ToString(),
@@ -2277,15 +2445,54 @@ TEST_P(ListTableCliParamTest, ListTabletWithPartitionInfo) {
     for (const auto& pt : table.tablet_with_partition()) {
       Partition partition;
       Partition::FromPB(pt.partition(), &partition);
-      const auto partition_str = partition_schema.PartitionDebugString(
-          partition, schema_internal, show_hp);
-      const auto tablet_with_partition = pt.tablet_id() + " : " + partition_str;
-      ASSERT_STR_CONTAINS(stdout, tablet_with_partition);
+      string partition_str;
+      if (show_tp) {
+        partition_str = " : " + partition_schema.PartitionDebugString(partition,
+                                                                      schema_internal,
+                                                                      show_hp);
+      }
+      string tablet_with_partition = pt.tablet_id() + partition_str;
+      if (std::get<2>(GetParam()) == "pretty") {
+        ASSERT_STR_CONTAINS(stdout, tablet_with_partition);
+      }
     }
   }
+
+  if (std::get<2>(GetParam()) == "pretty") {
+    ASSERT_STR_CONTAINS(stdout, Substitute("$0", kTableName));
+
+    for (auto& tablet_id : delta_tablet_ids) {
+      ASSERT_STR_CONTAINS(stdout, tablet_id);
+    }
+
+    for (auto& ts : tservers) {
+      ASSERT_STR_CONTAINS(stdout, ts->uuid());
+      ASSERT_STR_CONTAINS(stdout, ts->uuid());
+    }
+  } else if (std::get<2>(GetParam()) == "json") {
+    ASSERT_STR_CONTAINS(stdout, Substitute("\"name\": \"$0\"", kTableName));
+
+    for (auto& tablet_id : delta_tablet_ids) {
+      ASSERT_STR_CONTAINS(stdout, Substitute("\"tablet_id\": \"$0\"", tablet_id));
+    }
+
+    for (auto& ts : tservers) {
+      ASSERT_STR_CONTAINS(stdout, Substitute("\"uuid\": \"$0\"", ts->uuid()));
+    }
+  } else if (std::get<2>(GetParam()) == "json_compact") {
+    ASSERT_STR_CONTAINS(stdout, Substitute("\"name\":\"$0\"", kTableName));
+
+    for (auto& tablet_id : delta_tablet_ids) {
+      ASSERT_STR_CONTAINS(stdout, Substitute("\"tablet_id\":\"$0\"", tablet_id));
+    }
+
+    for (auto& ts : tservers) {
+      ASSERT_STR_CONTAINS(stdout, Substitute("\"uuid\":\"$0\"", ts->uuid()));
+    }
+  } else {
+    FAIL() << "unexpected table list format" << std::get<2>(GetParam());
+  }
 }
-INSTANTIATE_TEST_SUITE_P(IsHashPartitionInfoShown, ListTableCliParamTest,
-                         ::testing::Bool());
 
 TEST_F(AdminCliTest, TestLocateRow) {
   FLAGS_num_tablet_servers = 1;

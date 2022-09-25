@@ -1222,6 +1222,7 @@ TEST_F(ToolTest, TestTopLevelHelp) {
 }
 
 TEST_F(ToolTest, TestModeHelp) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   {
     const string kCmd = "cluster";
     const vector<string> kClusterModeRegexes = {
@@ -3280,6 +3281,7 @@ TEST_F(ToolTest, TestLoadgenKeepAutoTableAndData) {
   NO_FATALS(RunLoadgen(1, { "--keep_auto_table=true",
                             "--table_num_hash_partitions=1",
                             "--table_num_range_partitions=1" }));
+
   string auto_table_name;
   NO_FATALS(RunActionStdoutString(Substitute("table list $0",
       HostPort::ToCommaSeparatedString(cluster_->master_rpc_addrs())), &auto_table_name));
@@ -3323,6 +3325,7 @@ TEST_F(ToolTest, TestLoadgenKeepAutoTableAndData) {
 }
 
 TEST_F(ToolTest, TestLoadgenHmsEnabled) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   ExternalMiniClusterOptions opts;
   opts.hms_mode = HmsMode::ENABLE_HIVE_METASTORE;
   NO_FATALS(StartExternalMiniCluster(std::move(opts)));
@@ -3401,6 +3404,7 @@ TEST_F(ToolTest, TestLoadgenAutoGenTablePartitioning) {
 
 // Run the loadgen with txn-related options.
 TEST_F(ToolTest, LoadgenTxnBasics) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   {
     ExternalMiniClusterOptions opts;
     // Prefer lighter cluster to speed up testing.
@@ -3562,6 +3566,7 @@ R"(state
 // Test that a non-random workload results in the behavior we would expect when
 // running against an auto-generated range partitioned table.
 TEST_F(ToolTest, TestNonRandomWorkloadLoadgen) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   {
     ExternalMiniClusterOptions opts;
     opts.num_tablet_servers = 1;
@@ -4624,10 +4629,10 @@ TEST_F(ToolTest, TestRecallTable) {
   ASSERT_OK(client->OpenTable(kTableName, &table));
   string table_id = table->id();
 
-  // Delete the table.
+  // Soft-delete the table.
   string out;
-  NO_FATALS(RunActionStdoutNone(Substitute("table delete $0 $1",
-                                           master_addr, kTableName)));
+  NO_FATALS(RunActionStdoutNone(Substitute(
+      "table delete $0 $1 --reserve_seconds=300", master_addr, kTableName)));
 
   // List soft_deleted table.
   vector<string> kudu_tables;
@@ -4695,6 +4700,7 @@ TEST_F(ToolTest, TestRenameColumn) {
 }
 
 TEST_F(ToolTest, TestListTables) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   NO_FATALS(StartExternalMiniCluster());
   shared_ptr<KuduClient> client;
   ASSERT_OK(cluster_->CreateClient(nullptr, &client));
@@ -4732,12 +4738,14 @@ TEST_F(ToolTest, TestListTables) {
     if (kNumTables != num) {
       filter = Substitute("--tables=$0", JoinStrings(expected, ","));
     }
+
     vector<string> lines;
     NO_FATALS(RunActionStdoutLines(
         Substitute("table list $0 $1", master_addr, filter), &lines));
 
-    std::sort(lines.begin(), lines.end());
-    ASSERT_EQ(expected, lines);
+    for (auto& e : expected) {
+      ASSERT_STRINGS_ANY_MATCH(lines, e);
+    }
   };
 
   const auto ProcessTablets = [&] (const int num) {
@@ -4758,6 +4766,10 @@ TEST_F(ToolTest, TestListTables) {
       if (lines[i].empty()) {
         continue;
       }
+      if (MatchPattern(lines[i], "kudu.table_")) {
+        continue;
+      }
+      lines[i].erase(0, lines[i].find_first_not_of(' '));
       ASSERT_LE(i + 2, lines.size());
       output[lines[i]] = pair<string, string>(lines[i + 1], lines[i + 2]);
       i += 2;
@@ -4801,8 +4813,9 @@ TEST_F(ToolTest, TestListTables) {
     NO_FATALS(RunActionStdoutLines(
         Substitute("table list $0 $1 --show_table_info", master_addr, filter), &lines));
 
-    std::sort(lines.begin(), lines.end());
-    ASSERT_EQ(expected, lines);
+    for (auto& e : expected) {
+      ASSERT_STRINGS_ANY_MATCH(lines, e);
+    }
   };
 
   // List the tables and tablets.
@@ -5098,6 +5111,7 @@ TEST_F(ToolTest, TableCopyFaultTolerant) {
 }
 
 TEST_P(ToolTestCopyTableParameterized, TestCopyTable) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   for (const auto& arg : GenerateArgs()) {
     NO_FATALS(RunCopyTableCheck(arg));
   }
@@ -5789,6 +5803,7 @@ void ValidateHmsEntries(HmsClient* hms_client,
 }
 
 TEST_P(ToolTestKerberosParameterized, TestHmsDowngrade) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   ExternalMiniClusterOptions opts;
   opts.hms_mode = HmsMode::ENABLE_METASTORE_INTEGRATION;
   opts.enable_kerberos = EnableKerberos();
@@ -5849,6 +5864,7 @@ Status AlterHmsWithReplacedParam(HmsClient* hms_client,
 // Test HMS inconsistencies that can be automatically fixed.
 // Kerberos is enabled in order to test the tools work in secure clusters.
 TEST_P(ToolTestKerberosParameterized, TestCheckAndAutomaticFixHmsMetadata) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   string kUsername = "alice";
   string kOtherUsername = "bob";
   string kOtherComment = "a table comment";
@@ -6277,6 +6293,7 @@ TEST_P(ToolTestKerberosParameterized, TestCheckAndAutomaticFixHmsMetadata) {
 // TODO(ghenke): Add test case for external table using the same name as
 //  an existing Kudu table.
 TEST_P(ToolTestKerberosParameterized, TestCheckAndManualFixHmsMetadata) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   string kUsername = "alice";
   ExternalMiniClusterOptions opts;
   opts.hms_mode = HmsMode::DISABLE_HIVE_METASTORE;
@@ -6410,6 +6427,7 @@ TEST_P(ToolTestKerberosParameterized, TestCheckAndManualFixHmsMetadata) {
 }
 
 TEST_F(ToolTest, TestHmsIgnoresDifferentMasters) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   ExternalMiniClusterOptions opts;
   opts.num_masters = 2;
   opts.hms_mode = HmsMode::ENABLE_METASTORE_INTEGRATION;
@@ -6493,7 +6511,28 @@ TEST_F(ToolTest, TestHmsIgnoresDifferentMasters) {
       Substitute("hms check $0 --noignore-other-clusters", master_addrs_str)));
 }
 
+// Make sure that `kudu table delete` works as expected when HMS integration
+// is enabled, keeping the behavior of the tool backward-compatible even after
+// introducing the "table soft-delete" feature.
+TEST_F(ToolTest, DropTableHmsEnabled) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
+  ExternalMiniClusterOptions opts;
+  opts.hms_mode = HmsMode::ENABLE_METASTORE_INTEGRATION;
+  NO_FATALS(StartExternalMiniCluster(std::move(opts)));
+  const auto& master_rpc_addr =
+      HostPort::ToCommaSeparatedString(cluster_->master_rpc_addrs());
+  string out;
+  NO_FATALS(RunActionStdoutString(
+      Substitute("perf loadgen --keep_auto_table $0", master_rpc_addr), &out));
+  NO_FATALS(RunActionStdoutString(
+      Substitute("table list $0", master_rpc_addr), &out));
+  const auto table_name = out;
+  NO_FATALS(RunActionStdoutNone(
+      Substitute("table delete $0 $1", master_rpc_addr, table_name)));
+}
+
 TEST_F(ToolTest, TestHmsPrecheck) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   ExternalMiniClusterOptions opts;
   opts.hms_mode = HmsMode::ENABLE_HIVE_METASTORE;
   NO_FATALS(StartExternalMiniCluster(std::move(opts)));
@@ -6565,6 +6604,7 @@ TEST_F(ToolTest, TestHmsPrecheck) {
 }
 
 TEST_F(ToolTest, TestHmsList) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   ExternalMiniClusterOptions opts;
   opts.hms_mode = HmsMode::ENABLE_HIVE_METASTORE;
   opts.enable_kerberos = EnableKerberos();
@@ -6632,6 +6672,7 @@ TEST_F(ToolTest, TestHmsList) {
 }
 
 TEST_F(ToolTest, TestHMSAddressLog) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   ExternalMiniClusterOptions opts;
   opts.hms_mode = HmsMode::ENABLE_HIVE_METASTORE;
   opts.enable_kerberos = EnableKerberos();
@@ -6737,6 +6778,7 @@ INSTANTIATE_TEST_SUITE_P(SerializationModes, ControlShellToolTest,
                                             ::testing::Bool()));
 
 TEST_P(ControlShellToolTest, TestControlShell) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   constexpr auto kNumMasters = 1;
   constexpr auto kNumTservers = 3;
 
@@ -7401,6 +7443,7 @@ TEST_F(ToolTest, TestFsRemoveDataDirWithTombstone) {
 }
 
 TEST_F(ToolTest, TestFsAddRemoveDataDirEndToEnd) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   const string kTableFoo = "foo";
   const string kTableBar = "bar";
 
@@ -7589,6 +7632,7 @@ TEST_F(ToolTest, TestCheckFSWithNonDefaultMetadataDir) {
 }
 
 TEST_F(ToolTest, TestReplaceTablet) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   constexpr int kNumTservers = 3;
   constexpr int kNumTablets = 3;
   constexpr int kNumRows = 1000;
@@ -7735,6 +7779,7 @@ TEST_F(ToolTest, TestGetFlags) {
 
 // This is a synthetic test to provide coverage for regressions of KUDU-2819.
 TEST_F(ToolTest, TabletServersWithUnusualFlags) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   // Run many tablet servers: it helps in detection of races, if any.
 #if defined(THREAD_SANITIZER)
   // In case of TSAN builds, it takes too long to wait for the start up of too
@@ -7961,6 +8006,7 @@ class AuthzTServerChecksumTest : public ToolTest {
 
 // Test the authorization of Checksum scans via the CLI.
 TEST_F(AuthzTServerChecksumTest, TestAuthorizeChecksum) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   // First, let's create a table.
   const vector<string> loadgen_args = {
     "perf", "loadgen",
@@ -7982,6 +8028,7 @@ TEST_F(AuthzTServerChecksumTest, TestAuthorizeChecksum) {
 
 // Regression test for KUDU-2851.
 TEST_F(ToolTest, TestFailedTableScan) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   // Create a table using the loadgen tool.
   const string kTableName = "db.table";
   NO_FATALS(RunLoadgen(/*num_tservers*/1, /*tool_args*/{},kTableName));
@@ -8005,6 +8052,7 @@ TEST_F(ToolTest, TestFailedTableScan) {
 }
 
 TEST_F(ToolTest, TestFailedTableCopy) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   // Create a table using the loadgen tool.
   const string kTableName = "db.table";
   NO_FATALS(RunLoadgen(/*num_tservers*/1, /*tool_args*/{},kTableName));
@@ -8109,6 +8157,7 @@ TEST_F(ToolTest, TestDuplicateMastersInKsck) {
 }
 
 TEST_F(ToolTest, TestNonDefaultPrincipal) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   ExternalMiniClusterOptions opts;
   opts.enable_kerberos = true;
   opts.principal = "oryx";
@@ -8132,6 +8181,7 @@ class UnregisterTServerTest : public ToolTest, public ::testing::WithParamInterf
 INSTANTIATE_TEST_SUITE_P(, UnregisterTServerTest, ::testing::Bool());
 
 TEST_P(UnregisterTServerTest, TestUnregisterTServer) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   bool remove_tserver_state = GetParam();
 
   // Set a short timeout that masters consider a tserver dead.
@@ -8248,6 +8298,7 @@ TEST_F(UnregisterTServerTest, TestUnregisterTServerNotPresumedDead) {
 }
 
 TEST_F(ToolTest, TestLocalReplicaCopyLocal) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   // TODO(abukor): Rewrite the test to make sure it works with encryption
   // enabled.
   //
@@ -8342,6 +8393,7 @@ TEST_F(ToolTest, TestLocalReplicaCopyLocal) {
 }
 
 TEST_F(ToolTest, TestLocalReplicaCopyRemote) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   InternalMiniClusterOptions opts;
   opts.num_tablet_servers = 2;
   NO_FATALS(StartMiniCluster(std::move(opts)));
@@ -8376,6 +8428,7 @@ TEST_F(ToolTest, TestLocalReplicaCopyRemote) {
 }
 
 TEST_F(ToolTest, TestRebuildTserverByLocalReplicaCopy) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
   // Local copies are not supported on encrypted severs at this time.
   if (FLAGS_encrypt_data_at_rest) {
     GTEST_SKIP();
