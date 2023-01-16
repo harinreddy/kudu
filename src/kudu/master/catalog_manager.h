@@ -116,6 +116,7 @@ class TabletReplica;
 namespace master {
 
 class AuthzProvider;
+class AutoLeaderRebalancerTask;
 class AutoRebalancerTask;
 class CatalogManagerBgTasks;
 class HmsNotificationLogListenerTask;
@@ -736,6 +737,7 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   // Returns an error if any of the tablets are not running.
   Status GetTableLocations(const GetTableLocationsRequestPB* req,
                            GetTableLocationsResponsePB* resp,
+                           bool use_external_addr,
                            const std::optional<std::string>& user);
 
   // Dictionary mapping tablet servers to indexes, so that when a GetTableLocations
@@ -754,7 +756,8 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
     // Lookup the index for the given tablet server UUID. If that UUID has not been
     // added yet, allocates a new TSInfoPB and calls 'creator(pb)' to fill it in,
     // returning the index of the newly-added TS.
-    int LookupOrAdd(const std::string& uuid, const std::function<void(TSInfoPB*)>& creator);
+    int LookupOrAdd(const std::string& uuid,
+                    const std::function<bool(TSInfoPB*)>& creator);
 
     const std::vector<TSInfoPB*>& ts_info_pbs() const { return ts_info_pbs_; }
 
@@ -780,6 +783,7 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   // This only returns tablets which are in RUNNING state.
   Status GetTabletLocations(const std::string& tablet_id,
                             master::ReplicaTypeFilter filter,
+                            bool use_external_addr,
                             TabletLocationsPB* locs_pb,
                             TSInfosDict* ts_infos_dict,
                             const std::optional<std::string>& user);
@@ -824,8 +828,13 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   // Retrieve a table by ID, or null if no such table exists. May fail if the
   // catalog manager is not yet running. Caller must hold leader_lock_.
   //
-  // NOTE: This should only be used by tests or web-ui
-  Status GetTableInfo(const std::string& table_id, scoped_refptr<TableInfo> *table);
+  // NOTE: This should only be used by tests or web-ui.
+  Status GetTableInfo(const std::string& table_id, scoped_refptr<TableInfo>* table);
+
+  // Retrieve a table by table_name, or null if no such table exists.
+  //
+  // NOTE: This should only be used by tests.
+  void GetTableInfoByName(const std::string& table_name, scoped_refptr<TableInfo>* table);
 
   // Retrieve all known tables, even those that are not running. May fail if
   // the catalog manager is not yet running. Caller must hold leader_lock_.
@@ -877,6 +886,10 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
 
   master::AutoRebalancerTask* auto_rebalancer() const {
     return auto_rebalancer_.get();
+  }
+
+  master::AutoLeaderRebalancerTask* auto_leader_rebalancer() const {
+    return auto_leader_rebalancer_.get();
   }
 
   // Returns the normalized form of the provided table name.
@@ -1112,6 +1125,7 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   // Returns Status::ServiceUnavailable if tablet is not running.
   Status BuildLocationsForTablet(const scoped_refptr<TabletInfo>& tablet,
                                  master::ReplicaTypeFilter filter,
+                                 bool use_external_addr,
                                  TabletLocationsPB* locs_pb,
                                  TSInfosDict* ts_infos_dict);
 
@@ -1328,6 +1342,8 @@ class CatalogManager : public tserver::TabletReplicaLookupIf {
   std::unique_ptr<master::AuthzProvider> authz_provider_;
 
   std::unique_ptr<AutoRebalancerTask> auto_rebalancer_;
+
+  std::unique_ptr<AutoLeaderRebalancerTask> auto_leader_rebalancer_;
 
   enum State {
     kConstructed,

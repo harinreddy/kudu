@@ -697,15 +697,6 @@ public class AsyncKuduClient implements AutoCloseable {
   }
 
   /**
-   * Delete a table with the specified name. The table is purged immediately.
-   * @param name the table's name
-   * @return a deferred object to track the progress of the deleteTable command
-   */
-  public Deferred<DeleteTableResponse> deleteTable(String name) {
-    return deleteTable(name, NO_SOFT_DELETED_STATE_RESERVED_SECONDS);
-  }
-
-  /**
    * Delete a table with the specified name.
    * @param name the table's name
    * @param reserveSeconds the soft deleted table to be alive time
@@ -719,6 +710,22 @@ public class AsyncKuduClient implements AutoCloseable {
                                                        timer,
                                                        defaultAdminOperationTimeoutMs,
                                                        reserveSeconds);
+    return sendRpcToTablet(delete);
+  }
+
+  /**
+   * Delete a table with the specified name.
+   * The behavior of DeleteRPC is controlled by the
+   * '--default_deleted_table_reserve_seconds' flag on master.
+   * @param name the table's name
+   * @return a deferred object to track the progress of the deleteTable command
+   */
+  public Deferred<DeleteTableResponse> deleteTable(String name) {
+    checkIsClosed();
+    DeleteTableRequest delete = new DeleteTableRequest(this.masterTable,
+                                                       name,
+                                                       timer,
+                                                       defaultAdminOperationTimeoutMs);
     return sendRpcToTablet(delete);
   }
 
@@ -923,7 +930,7 @@ public class AsyncKuduClient implements AutoCloseable {
    * specified, it only returns tables that satisfy a substring match.
    * @param nameFilter an optional table name filter
    * @param showSoftDeleted whether to display only regular (i.e. not soft deleted)
-   * tables or all tables（i.e. soft deleted tables and regular tables）
+   * tables or all tables (i.e. soft deleted tables and regular tables)
    * @return a deferred that yields the list of table names
    */
   public Deferred<ListTablesResponse> getTablesList(String nameFilter, boolean showSoftDeleted) {
@@ -2771,7 +2778,8 @@ public class AsyncKuduClient implements AutoCloseable {
   }
 
   /**
-   * Sends a request to the master to check if the cluster supports ignore operations.
+   * Sends a request to the master to check if the cluster supports ignore operations, including
+   * InsertIgnore, UpdateIgnore and DeleteIgnore operations.
    * @return true if the cluster supports ignore operations
    */
   @InterfaceAudience.Private
@@ -2782,8 +2790,6 @@ public class AsyncKuduClient implements AutoCloseable {
     Deferred<PingResponse> response = sendRpcToTablet(ping);
     return AsyncUtil.addBoth(response, new PingSupportsFeatureCallback());
   }
-
-  // TODO(yingchun): also need add 'public Deferred<Boolean> supportsUpsertIgnoreOperations()'
 
   private static final class PingSupportsFeatureCallback implements Callback<Boolean, Object> {
     @Override

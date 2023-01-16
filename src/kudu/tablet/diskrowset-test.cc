@@ -64,6 +64,7 @@
 #include "kudu/util/bloom_filter.h"
 #include "kudu/util/faststring.h"
 #include "kudu/util/memory/arena.h"
+#include "kudu/util/monotime.h"
 #include "kudu/util/random.h"
 #include "kudu/util/slice.h"
 #include "kudu/util/status.h"
@@ -82,6 +83,8 @@ DECLARE_bool(cfile_lazy_open);
 DECLARE_bool(crash_on_eio);
 DECLARE_int32(cfile_default_block_size);
 DECLARE_double(env_inject_eio);
+DECLARE_int32(tablet_history_max_age_sec);
+DECLARE_bool(rowset_metadata_store_keys);
 DECLARE_double(tablet_delta_store_major_compact_min_ratio);
 DECLARE_int32(tablet_delta_store_minor_compact_max);
 
@@ -543,18 +546,18 @@ TEST_F(TestRowSet, TestMakeDeltaIteratorMergerUnlocked) {
   ASSERT_OK(OpenTestRowSet(&rs));
   UpdateExistingRows(rs.get(), FLAGS_update_fraction, nullptr);
   ASSERT_OK(rs->FlushDeltas(nullptr));
-  DeltaTracker *dt = rs->delta_tracker();
-  int num_stores = dt->redo_delta_stores_.size();
+  const DeltaTracker& dt = rs->delta_tracker();
+  size_t num_stores = dt.redo_delta_stores_.size();
+  ASSERT_GT(num_stores, 0);
   vector<shared_ptr<DeltaStore> > compacted_stores;
   vector<BlockId> compacted_blocks;
   unique_ptr<DeltaIterator> merge_iter;
-  ASSERT_OK(dt->MakeDeltaIteratorMergerUnlocked(nullptr, 0, num_stores - 1, &schema_,
-                                                &compacted_stores,
-                                                &compacted_blocks, &merge_iter));
+  ASSERT_OK(dt.MakeDeltaIteratorMergerUnlocked(nullptr, 0, num_stores - 1, &schema_,
+                                               &compacted_stores,
+                                               &compacted_blocks, &merge_iter));
   vector<string> results;
   ASSERT_OK(DebugDumpDeltaIterator(REDO, merge_iter.get(), schema_,
-                                          ITERATE_OVER_ALL_ROWS,
-                                          &results));
+                                   ITERATE_OVER_ALL_ROWS, &results));
   for (const string &str : results) {
     VLOG(1) << str;
   }
@@ -611,10 +614,10 @@ TEST_F(TestRowSet, TestCompactStores) {
       RowSet::MAJOR_DELTA_COMPACTION)));
 
   // Compact the deltafiles
-  DeltaTracker *dt = rs->delta_tracker();
+  auto* dt = rs->mutable_delta_tracker();
   int num_stores = dt->redo_delta_stores_.size();
   VLOG(1) << "Number of stores before compaction: " << num_stores;
-  ASSERT_EQ(num_stores, 3);
+  ASSERT_EQ(3, num_stores);
   ASSERT_OK(dt->CompactStores(nullptr, 0, num_stores - 1));
   num_stores = dt->redo_delta_stores_.size();
   VLOG(1) << "Number of stores after compaction: " << num_stores;
@@ -641,6 +644,57 @@ TEST_F(TestRowSet, TestCompactStores) {
   ASSERT_TRUE(is_sorted(results.begin(), results.end()));
 }
 
+TEST_F(TestRowSet, TestGCScheduleRedoFilesWithFullOfDeleteOP) {
+  // Make major delta compaction runnable even with tiny amount of data accumulated
+  // across rowset's deltas.
+  FLAGS_tablet_delta_store_major_compact_min_ratio = 0.0001;
+  // Write the min/max keys to the rowset metadata. In this way, we can simplify the
+  // test scenario by focusing on the REDO delta store files.
+  FLAGS_rowset_metadata_store_keys = true;
+
+  WriteTestRowSet();
+  {
+    shared_ptr<DiskRowSet> rs;
+    ASSERT_OK(OpenTestRowSet(&rs));
+
+    // Generate base data.
+    ASSERT_OK(rs->FlushDeltas(nullptr));
+  }
+
+  // Reopen the rowset.
+  {
+    shared_ptr<DiskRowSet> rs;
+    ASSERT_OK(OpenTestRowSet(&rs));
+    const DeltaTracker& dt = rs->delta_tracker();
+    ASSERT_EQ(0, dt.CountUndoDeltaStores());
+    ASSERT_EQ(0, dt.CountRedoDeltaStores());
+
+    int loop_cnt = 10;
+    int loop_per_idx = FLAGS_roundtrip_num_rows / loop_cnt;
+    // Generate delta files with DELETE operations.
+    for (int i = 0; i < loop_cnt; i++) {
+      NO_FATALS(DeleteExistingRows(rs.get(), loop_per_idx * i, loop_per_idx * (i + 1), nullptr));
+      ASSERT_OK(rs->FlushDeltas(nullptr));
+      ASSERT_EQ(0, dt.CountUndoDeltaStores());
+      ASSERT_EQ(i + 1, dt.CountRedoDeltaStores());
+    }
+
+    ASSERT_EQ(0, rs->DeltaStoresCompactionPerfImprovementScore(RowSet::MAJOR_DELTA_COMPACTION));
+
+    // Modify the threshold so we can trigger a new round of gc scheduling.
+    FLAGS_tablet_history_max_age_sec = 1;
+    SleepFor(MonoDelta::FromSeconds(2));
+
+    // Major delta compaction of the DRS should obtain a non-zero score.
+    NO_FATALS(BetweenZeroAndOne(rs->DeltaStoresCompactionPerfImprovementScore(
+              RowSet::MAJOR_DELTA_COMPACTION)));
+
+    ASSERT_OK(rs->MajorCompactDeltaStores(nullptr, HistoryGcOpts::Disabled()));
+    ASSERT_EQ(0, dt.CountUndoDeltaStores());
+    ASSERT_EQ(1, dt.CountRedoDeltaStores());
+  }
+}
+
 TEST_F(TestRowSet, TestGCAncientStores) {
   // Disable lazy open so that major delta compactions don't require manual REDO initialization.
   FLAGS_cfile_lazy_open = false;
@@ -650,7 +704,7 @@ TEST_F(TestRowSet, TestGCAncientStores) {
   WriteTestRowSet();
   shared_ptr<DiskRowSet> rs;
   ASSERT_OK(OpenTestRowSet(&rs));
-  DeltaTracker *dt = rs->delta_tracker();
+  DeltaTracker* dt = rs->mutable_delta_tracker();
   ASSERT_EQ(0, dt->CountUndoDeltaStores());
   ASSERT_EQ(0, dt->CountRedoDeltaStores());
 
@@ -791,7 +845,8 @@ TEST_P(DiffScanRowSetTest, TestFuzz) {
     if (add_vc_is_deleted) {
       bool read_default = false;
       col_schemas.emplace_back("is_deleted", IS_DELETED, /*is_nullable=*/ false,
-                               /*is_immutable=*/ false, &read_default);
+                               /*is_immutable=*/ false, /*is_auto_incrementing=*/ false,
+                               &read_default);
       col_ids.emplace_back(schema_.max_col_id() + 1);
     }
     Schema projection(col_schemas, col_ids, 1);

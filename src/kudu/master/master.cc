@@ -38,6 +38,7 @@
 #include "kudu/fs/fs_manager.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/join.h"
+#include "kudu/gutil/strings/split.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/hms/hms_catalog.h"
 #include "kudu/master/catalog_manager.h"
@@ -60,6 +61,7 @@
 #include "kudu/tserver/tablet_service.h"
 #include "kudu/util/countdown_latch.h"
 #include "kudu/util/flag_tags.h"
+#include "kudu/util/flag_validators.h"
 #include "kudu/util/logging.h"
 #include "kudu/util/maintenance_manager.h"
 #include "kudu/util/monotime.h"
@@ -112,8 +114,18 @@ DEFINE_string(location_mapping_cmd, "",
               "characters from the set [a-zA-Z0-9_-.]. If the cluster is not "
               "using location awareness features this flag should not be set.");
 
+DEFINE_string(master_rpc_proxy_advertised_addresses, "",
+              "RPC endpoints of all masters in this cluster exposed to the "
+              "external network via a TCP proxy. This is a comma-separated "
+              "list of the masters' proxy-advertised RPC addresses, each "
+              "specified via the --rpc_proxy_advertised_addresses "
+              "flag for a single master.");
+TAG_FLAG(master_rpc_proxy_advertised_addresses, experimental);
+
 DECLARE_bool(txn_manager_lazily_initialized);
 DECLARE_bool(txn_manager_enabled);
+DECLARE_string(master_addresses);
+DECLARE_string(rpc_proxy_advertised_addresses);
 
 using kudu::consensus::RaftPeerPB;
 using kudu::fs::ErrorHandlerType;
@@ -129,6 +141,7 @@ using std::shared_ptr;
 using std::string;
 using std::unique_ptr;
 using std::vector;
+using strings::Split;
 using strings::Substitute;
 
 namespace kudu {
@@ -140,7 +153,40 @@ class RpcContext;
 namespace kudu {
 namespace master {
 
+
 namespace {
+
+// This validator issues a warning (not an error) to allow for a temporary
+// configurations when adding a new master.
+bool ValidateMultiMasterProxiedRpcFlags() {
+  if (FLAGS_rpc_proxy_advertised_addresses.empty()) {
+    return true;
+  }
+  const vector<string> master_addrs = Split(FLAGS_master_addresses, ",");
+  if (master_addrs.size() <= 1) {
+    return true;
+  }
+  // Make sure --master_rpc_proxy_advertised_addresses is set if a multi-master
+  // flags are detected and --rpc_proxy_advertised_addresses is set as well.
+  // Also, check whether the number of masters in the internal network
+  // corresponds to the number of masters advertised for clients in external
+  // networks.
+  if (FLAGS_master_rpc_proxy_advertised_addresses.empty()) {
+    LOG(WARNING) << Substitute(
+        "--master_rpc_proxy_advertised_addresses should be set as well "
+        "when configuring RPC proxying in a multi-master cluster");
+  }
+  const vector<string> master_proxy_addrs =
+      Split(FLAGS_master_rpc_proxy_advertised_addresses, ",");
+  if (master_proxy_addrs.size() != master_addrs.size()) {
+    LOG(WARNING) << Substitute(
+        "--master_rpc_proxy_advertised_addresses and --master_addresses "
+        "should have same number of elements");
+  }
+  return true;
+}
+GROUP_FLAG_VALIDATOR(multi_master_pp, &ValidateMultiMasterProxiedRpcFlags);
+
 constexpr const char* kReplaceMasterMessage =
     "this master may return incorrect results and should be replaced";
 void CrashMasterOnDiskError(const string& uuid) {
@@ -235,6 +281,18 @@ Status Master::Init() {
       FLAGS_authz_token_validity_seconds,
       FLAGS_tsk_rotation_seconds,
       messenger_->shared_token_verifier()));
+
+  if (!FLAGS_master_rpc_proxy_advertised_addresses.empty()) {
+    vector<HostPort> host_ports;
+    RETURN_NOT_OK(HostPort::ParseStrings(
+        FLAGS_master_rpc_proxy_advertised_addresses, kDefaultPort, &host_ports));
+    if (host_ports.empty()) {
+      return Status::InvalidArgument(
+          "the set of RPC advertised master addresses is empty");
+    }
+    master_rpc_proxy_advertised_hostports_ = std::move(host_ports);
+  }
+
   state_ = kInitialized;
   return Status::OK();
 }
@@ -392,11 +450,27 @@ Status Master::WaitUntilCatalogManagerIsLeaderAndReadyForTests(const MonoDelta& 
                           s.ToString());
 }
 
-Status Master::GetMasterRegistration(ServerRegistrationPB* reg) const {
+Status Master::GetMasterRegistration(ServerRegistrationPB* reg,
+                                     bool use_external_addr) const {
   if (!registration_initialized_.load(std::memory_order_acquire)) {
     return Status::ServiceUnavailable("Master startup not complete");
   }
   reg->CopyFrom(registration_);
+  if (use_external_addr) {
+    DCHECK_GT(reg->rpc_proxy_addresses_size(), 0);
+    if (reg->rpc_proxy_addresses_size() > 0) {
+      reg->clear_rpc_addresses();
+      reg->mutable_rpc_addresses()->CopyFrom(reg->rpc_proxy_addresses());
+    }
+
+    // TODO(aserbin): uncomment once the webserver proxy advertised addresses
+    //                are properly propagated in the code
+    //DCHECK_GT(reg->proxy_http_addresses_size(), 0);
+    if (reg->http_proxy_addresses_size() > 0) {
+      reg->clear_http_addresses();
+      reg->mutable_http_addresses()->CopyFrom(reg->http_proxy_addresses());
+    }
+  }
   return Status::OK();
 }
 
@@ -503,7 +577,8 @@ Status Master::DeleteExpiredReservedTables() {
   return Status::OK();
 }
 
-Status Master::ListMasters(vector<ServerEntryPB>* masters) const {
+Status Master::ListMasters(vector<ServerEntryPB>* masters,
+                           bool use_external_addr) const {
   auto consensus = catalog_manager_->master_consensus();
   if (!consensus) {
     return Status::IllegalState("consensus not running");
@@ -516,7 +591,8 @@ Status Master::ListMasters(vector<ServerEntryPB>* masters) const {
   if (config.peers_size() == 1) {
     ServerEntryPB local_entry;
     local_entry.mutable_instance_id()->CopyFrom(catalog_manager_->NodeInstance());
-    RETURN_NOT_OK(GetMasterRegistration(local_entry.mutable_registration()));
+    RETURN_NOT_OK(GetMasterRegistration(local_entry.mutable_registration(),
+                                        use_external_addr));
     local_entry.set_role(RaftPeerPB::LEADER);
     local_entry.set_cluster_id(catalog_manager_->GetClusterId());
     local_entry.set_member_type(RaftPeerPB::VOTER);
@@ -526,24 +602,36 @@ Status Master::ListMasters(vector<ServerEntryPB>* masters) const {
 
   // For distributed master configuration.
   for (const auto& peer : config.peers()) {
-    HostPort hp = HostPortFromPB(peer.last_known_addr());
+    const auto hp = HostPortFromPB(peer.last_known_addr());
     ServerEntryPB peer_entry;
-    Status s = GetMasterEntryForHost(messenger_, hp, &peer_entry);
-    if (!s.ok()) {
-      s = s.CloneAndPrepend(
-          Substitute("Unable to get registration information for peer $0 ($1)",
-                     peer.permanent_uuid(),
-                     hp.ToString()));
+    if (auto s = GetMasterEntryForHost(messenger_, hp, &peer_entry); !s.ok()) {
+      const auto errmsg = Substitute("unable to get registration information for peer $0",
+                                     peer.permanent_uuid());
+      s = s.CloneAndPrepend(errmsg);
+      if (use_external_addr) {
+        StatusToPB(Status::IllegalState(errmsg), peer_entry.mutable_error());
+      } else {
+        StatusToPB(s, peer_entry.mutable_error());
+      }
       LOG(WARNING) << s.ToString();
-      StatusToPB(s, peer_entry.mutable_error());
     } else if (peer_entry.instance_id().permanent_uuid() != peer.permanent_uuid()) {
-      StatusToPB(Status::IllegalState(
-          Substitute("mismatched UUIDs: expected UUID $0 from master at $1, but got UUID $2",
-                     peer.permanent_uuid(),
-                     hp.ToString(),
-                     peer_entry.instance_id().permanent_uuid())),
+      StatusToPB(Status::IllegalState(Substitute("UUID mismatch: $0 vs $1 expected",
+                                                 peer_entry.instance_id().permanent_uuid(),
+                                                 peer.permanent_uuid())),
                  peer_entry.mutable_error());
+      LOG(WARNING) << Substitute(
+          "UUID mismatch: $0 vs $1 expected for master at $2",
+          peer_entry.instance_id().permanent_uuid(), peer.permanent_uuid(), hp.ToString());
     }
+    if (use_external_addr && peer_entry.has_registration()) {
+      auto* reg = peer_entry.mutable_registration();
+      reg->mutable_rpc_addresses()->Swap(reg->mutable_rpc_proxy_addresses());
+      reg->clear_rpc_proxy_addresses();
+
+      reg->mutable_http_addresses()->Swap(reg->mutable_http_proxy_addresses());
+      reg->clear_http_proxy_addresses();
+    }
+
     masters->emplace_back(std::move(peer_entry));
   }
   return Status::OK();
@@ -702,6 +790,19 @@ Status Master::RemoveMaster(const HostPort& hp, const string& uuid, rpc::RpcCont
   // If it's in progress, on initiating config change Raft will return error.
   return catalog_manager()->InitiateMasterChangeConfig(CatalogManager::kRemoveMaster, hp,
                                                        matching_uuid, rpc);
+}
+
+const vector<HostPort>& Master::GetProxyAdvertisedHostPorts() const {
+  // In case of multi-master configuration or a single-master configuration
+  // where --master_rpc_proxy_advertised_addresses is specified, get the list
+  // of proxy advertised <host, port> pairs from that flag.
+  DCHECK_NE(kStopped, state_);
+  if (!master_rpc_proxy_advertised_hostports_.empty()) {
+    return master_rpc_proxy_advertised_hostports_;
+  }
+
+  // Otherwise, return whatever is set for --rpc_proxy_advertised_addresses
+  return rpc_server()->GetProxyAdvertisedHostPorts();
 }
 
 } // namespace master

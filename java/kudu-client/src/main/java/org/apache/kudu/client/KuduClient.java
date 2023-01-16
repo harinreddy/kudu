@@ -163,12 +163,15 @@ public class KuduClient implements AutoCloseable {
 
   /**
    * Delete a table on the cluster with the specified name.
+   * The deleted table may turn to soft-deleted status with the flag
+   * default_deleted_table_reserve_seconds set to nonzero on the master side.
+   *
    * @param name the table's name
    * @return an rpc response object
    * @throws KuduException if anything went wrong
    */
   public DeleteTableResponse deleteTable(String name) throws KuduException {
-    Deferred<DeleteTableResponse> d = asyncClient.deleteTable(name, 0);
+    Deferred<DeleteTableResponse> d = asyncClient.deleteTable(name);
     return joinAndHandleException(d);
   }
 
@@ -488,7 +491,8 @@ public class KuduClient implements AutoCloseable {
   }
 
   /**
-   * Sends a request to the master to check if the cluster supports ignore operations.
+   * Sends a request to the master to check if the cluster supports ignore operations, including
+   * InsertIgnore, UpdateIgnore and DeleteIgnore operations.
    * @return true if the cluster supports ignore operations
    */
   @InterfaceAudience.Private

@@ -17,12 +17,12 @@
 
 #include "kudu/client/scan_token-internal.h"
 
-#include <cstdint>
 #include <map>
 #include <memory>
 #include <optional>
 #include <ostream>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -40,8 +40,10 @@
 #include "kudu/client/shared_ptr.h" // IWYU pragma: keep
 #include "kudu/client/tablet-internal.h"
 #include "kudu/client/tablet_server-internal.h"
+#include "kudu/common/column_predicate.h"
 #include "kudu/common/common.pb.h"
 #include "kudu/common/encoded_key.h"
+#include "kudu/common/key_range.h"
 #include "kudu/common/partition.h"
 #include "kudu/common/partition_pruner.h"
 #include "kudu/common/scan_spec.h"
@@ -54,7 +56,6 @@
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/master/master.pb.h"
 #include "kudu/security/token.pb.h"
-#include "kudu/util/async_util.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/slice.h"
@@ -68,7 +69,6 @@ using strings::Substitute;
 
 namespace kudu {
 
-class ColumnPredicate;
 using master::GetTableLocationsResponsePB;
 using master::TableIdentifierPB;
 using master::TabletLocationsPB;
@@ -237,6 +237,23 @@ Status KuduScanToken::Data::PBIntoScanner(KuduClient* client,
     configuration->AddConjunctPredicate(std::move(*predicate));
   }
 
+  switch (message.replica_selection()) {
+    case kudu::ReplicaSelection::LEADER_ONLY:
+      RETURN_NOT_OK_LOG(configuration->SetSelection(KuduClient::ReplicaSelection::LEADER_ONLY),
+                        ERROR, "set replica selection LEADER_ONLY failed");
+      break;
+    case kudu::ReplicaSelection::CLOSEST_REPLICA:
+      RETURN_NOT_OK_LOG(configuration->SetSelection(KuduClient::ReplicaSelection::CLOSEST_REPLICA),
+                        ERROR, "set replica selection CLOSEST_REPLICA failed");
+      break;
+    case kudu::ReplicaSelection::FIRST_REPLICA:
+      RETURN_NOT_OK_LOG(configuration->SetSelection(KuduClient::ReplicaSelection::FIRST_REPLICA),
+                        ERROR, "set replica selection FIRST_REPLICA failed");
+      break;
+    default:
+      return Status::NotSupported("unsupported ReplicaSelection policy");
+  }
+
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
   if (message.has_lower_bound_primary_key()) {
@@ -394,6 +411,19 @@ Status KuduScanTokenBuilder::Data::Build(vector<KuduScanToken*>* tokens) {
     ColumnPredicateToPB(predicate_pair.second, pb.add_column_predicates());
   }
 
+  switch (configuration_.selection_) {
+    case KuduClient::ReplicaSelection::LEADER_ONLY:
+      pb.set_replica_selection(kudu::ReplicaSelection::LEADER_ONLY);
+      break;
+    case KuduClient::ReplicaSelection::CLOSEST_REPLICA:
+      pb.set_replica_selection(kudu::ReplicaSelection::CLOSEST_REPLICA);
+      break;
+    case KuduClient::ReplicaSelection::FIRST_REPLICA:
+      pb.set_replica_selection(kudu::ReplicaSelection::FIRST_REPLICA);
+      break;
+    default:
+      return Status::InvalidArgument("replica_selection is invalid.");
+  }
   const KuduScanner::ReadMode read_mode = configuration_.read_mode();
   switch (read_mode) {
     case KuduScanner::READ_LATEST:
@@ -432,36 +462,51 @@ Status KuduScanTokenBuilder::Data::Build(vector<KuduScanToken*>* tokens) {
     pb.set_batch_size_bytes(configuration_.batch_size_bytes());
   }
 
-  MonoTime deadline = MonoTime::Now() + client->default_admin_operation_timeout();
-
   PartitionPruner pruner;
+  vector<MetaCache::RangeWithRemoteTablet> range_tablets;
   pruner.Init(*table->schema().schema_, table->partition_schema(), configuration_.spec());
   while (pruner.HasMorePartitionKeyRanges()) {
-    scoped_refptr<internal::RemoteTablet> tablet;
-    Synchronizer sync;
+    PartitionKey key_range;
+    vector<MetaCache::RangeWithRemoteTablet> tmp_range_tablets;
     const auto& partition_key = pruner.NextPartitionKey();
-    client->data_->meta_cache_->LookupTabletByKey(table,
-                                                  partition_key,
-                                                  deadline,
-                                                  MetaCache::LookupType::kLowerBound,
-                                                  &tablet,
-                                                  sync.AsStatusCallback());
-    const auto s = sync.Wait();
+    Status s = client->data_->meta_cache_->GetTableKeyRanges(
+        table,
+        partition_key,
+        MetaCache::LookupType::kLowerBound,
+        split_size_bytes_,
+        client->default_rpc_timeout(),
+        &tmp_range_tablets);
+
     if (s.IsNotFound()) {
-      // No more tablets in the table.
       pruner.RemovePartitionKeyRange({});
       continue;
     }
     RETURN_NOT_OK(s);
 
-    // Check if the meta cache returned a tablet covering a partition key range past
-    // what we asked for. This can happen if the requested partition key falls
-    // in a non-covered range. In this case we can potentially prune the tablet.
-    if (partition_key < tablet->partition().begin() &&
-        pruner.ShouldPrune(tablet->partition())) {
-      pruner.RemovePartitionKeyRange(tablet->partition().end());
-      continue;
+    if (tmp_range_tablets.empty()) {
+      pruner.RemovePartitionKeyRange(partition_key);
+    } else {
+      // If split_size_bytes_ set to zero, we just do search in meta cache.
+      // Check if the meta cache returned a tablet covering a partition key range past
+      // what we asked for. This can happen if the requested partition key falls
+      // in a non-covered range. In this case we can potentially prune the tablet.
+      if (split_size_bytes_ == 0 &&
+          partition_key < tmp_range_tablets.back().remote_tablet->partition().begin() &&
+          pruner.ShouldPrune(tmp_range_tablets.back().remote_tablet->partition())) {
+        pruner.RemovePartitionKeyRange(tmp_range_tablets.back().remote_tablet->partition().end());
+        continue;
+      }
+      for (auto& range_tablet : tmp_range_tablets) {
+        range_tablets.push_back(range_tablet);
+      }
+      pruner.RemovePartitionKeyRange(tmp_range_tablets.back().remote_tablet->partition().end());
     }
+  }
+
+  for (const auto& range_tablet : range_tablets) {
+    const auto& range = range_tablet.key_range;
+    const auto& tablet = range_tablet.remote_tablet;
+
     vector<internal::RemoteReplica> replicas;
     tablet->GetRemoteReplicas(&replicas);
 
@@ -499,6 +544,15 @@ Status KuduScanTokenBuilder::Data::Build(vector<KuduScanToken*>* tokens) {
     message.CopyFrom(pb);
     message.set_lower_bound_partition_key(tablet->partition().begin().ToString());
     message.set_upper_bound_partition_key(tablet->partition().end().ToString());
+    if (!range.start_primary_key().empty() && split_size_bytes_) {
+      message.clear_lower_bound_primary_key();
+      message.set_lower_bound_primary_key(range.start_primary_key());
+    }
+    if (!range.stop_primary_key().empty() && split_size_bytes_) {
+      message.clear_upper_bound_primary_key();
+      message.set_upper_bound_primary_key(range.stop_primary_key());
+    }
+
 
     // Set the tablet metadata so that a call to the master is not needed to
     // locate the tablet to scan when opening the scanner.
@@ -557,8 +611,8 @@ Status KuduScanTokenBuilder::Data::Build(vector<KuduScanToken*>* tokens) {
                                 std::move(message),
                                 std::move(client_tablet));
     tokens->push_back(client_scan_token.release());
-    pruner.RemovePartitionKeyRange(tablet->partition().end());
   }
+
   return Status::OK();
 }
 

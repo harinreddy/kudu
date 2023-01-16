@@ -128,6 +128,7 @@ kudu::DataType ToInternalDataType(KuduColumnSchema::DataType type,
     case KuduColumnSchema::INT16: return kudu::INT16;
     case KuduColumnSchema::INT32: return kudu::INT32;
     case KuduColumnSchema::INT64: return kudu::INT64;
+    case KuduColumnSchema::SERIAL: return kudu::UINT64;
     case KuduColumnSchema::UNIXTIME_MICROS: return kudu::UNIXTIME_MICROS;
     case KuduColumnSchema::DATE: return kudu::DATE;
     case KuduColumnSchema::FLOAT: return kudu::FLOAT;
@@ -156,6 +157,7 @@ KuduColumnSchema::DataType FromInternalDataType(kudu::DataType type) {
     case kudu::INT16: return KuduColumnSchema::INT16;
     case kudu::INT32: return KuduColumnSchema::INT32;
     case kudu::INT64: return KuduColumnSchema::INT64;
+    case kudu::UINT64: return KuduColumnSchema::SERIAL;
     case kudu::UNIXTIME_MICROS: return KuduColumnSchema::UNIXTIME_MICROS;
     case kudu::DATE: return KuduColumnSchema::DATE;
     case kudu::FLOAT: return KuduColumnSchema::FLOAT;
@@ -228,7 +230,6 @@ uint16_t KuduColumnTypeAttributes::length() const {
 Status KuduColumnStorageAttributes::StringToEncodingType(
     const string& encoding,
     KuduColumnStorageAttributes::EncodingType* type) {
-  Status s;
   string encoding_uc;
   ToUpperCase(encoding, &encoding_uc);
   if (encoding_uc == "AUTO_ENCODING") {
@@ -246,16 +247,15 @@ Status KuduColumnStorageAttributes::StringToEncodingType(
   } else if (encoding_uc == "GROUP_VARINT") {
     *type = KuduColumnStorageAttributes::GROUP_VARINT;
   } else {
-    s = Status::InvalidArgument(Substitute(
+    return Status::InvalidArgument(Substitute(
         "encoding type $0 is not supported", encoding));
   }
-  return s;
+  return Status::OK();
 }
 
 Status KuduColumnStorageAttributes::StringToCompressionType(
     const string& compression,
     KuduColumnStorageAttributes::CompressionType* type) {
-  Status s;
   string compression_uc;
   ToUpperCase(compression, &compression_uc);
   if (compression_uc == "DEFAULT_COMPRESSION") {
@@ -269,10 +269,10 @@ Status KuduColumnStorageAttributes::StringToCompressionType(
   } else if (compression_uc == "ZLIB") {
     *type = KuduColumnStorageAttributes::ZLIB;
   } else {
-    s = Status::InvalidArgument(Substitute(
+    return Status::InvalidArgument(Substitute(
         "compression type $0 is not supported", compression));
   }
-  return s;
+  return Status::OK();
 }
 
 ////////////////////////////////////////////////////////////
@@ -335,6 +335,11 @@ KuduColumnSpec* KuduColumnSpec::Length(uint16_t length) {
 
 KuduColumnSpec* KuduColumnSpec::PrimaryKey() {
   data_->primary_key = true;
+  return this;
+}
+
+KuduColumnSpec* KuduColumnSpec::AutoIncrementing() {
+  data_->auto_incrementing = true;
   return this;
 }
 
@@ -468,6 +473,27 @@ Status KuduColumnSpec::ToColumnSchema(KuduColumnSchema* col) const {
   bool nullable = data_->nullable ? data_->nullable.value() : true;
   bool immutable = data_->immutable ? data_->immutable.value() : false;
 
+  if (data_->auto_incrementing) {
+    if (internal_type != kudu::INT64) {
+      return Status::InvalidArgument("auto-incrementing column should be of type INT64");
+    }
+    if (nullable) {
+      return Status::InvalidArgument("auto-incrementing column should not be nullable");
+    }
+    if (immutable) {
+      return Status::InvalidArgument("auto-incrementing column should not be immutable");
+    }
+    if (data_->default_val) {
+      return Status::InvalidArgument("auto-incrementing column cannot have a "
+                                     "default value");
+    }
+    // TODO(Marton): Uncomment once the client patch promotes the
+    // auto increment column to primary key
+    //if (!data_->primary_key) {
+    //   return Status::InvalidArgument("auto-incrementing column is not set as primary key "
+    //                                  "column");
+    //}
+  }
   void* default_val = nullptr;
   // TODO(unknown): distinguish between DEFAULT NULL and no default?
   if (data_->default_val) {
@@ -488,7 +514,7 @@ Status KuduColumnSpec::ToColumnSchema(KuduColumnSchema* col) const {
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
   *col = KuduColumnSchema(data_->name, data_->type.value(), nullable,
-                          immutable, default_val,
+                          immutable, data_->auto_incrementing, default_val,
                           KuduColumnStorageAttributes(encoding, compression, block_size),
                           type_attrs,
                           data_->comment ? data_->comment.value() : "");
@@ -705,13 +731,14 @@ string KuduColumnSchema::DataTypeToString(DataType type) {
       return "DECIMAL";
     case VARCHAR:
       return "VARCHAR";
+    case SERIAL:
+      return "SERIAL";
   }
   LOG(FATAL) << "Unhandled type " << type;
 }
 
  Status KuduColumnSchema::StringToDataType(
       const string& type_str, KuduColumnSchema::DataType* type) {
-  Status s;
   string type_uc;
   ToUpperCase(type_str, &type_uc);
   if (type_uc == "INT8") {
@@ -740,17 +767,20 @@ string KuduColumnSchema::DataTypeToString(DataType type) {
     *type = VARCHAR;
   } else if (type_uc == "DATE") {
     *type = DATE;
+  } else if (type_uc == "SERIAL") {
+    *type = SERIAL;
   } else {
-    s = Status::InvalidArgument(Substitute(
+    return Status::InvalidArgument(Substitute(
         "data type $0 is not supported", type_str));
   }
-  return s;
+  return Status::OK();
 }
 
 KuduColumnSchema::KuduColumnSchema(const string &name,
                                    DataType type,
                                    bool is_nullable,
                                    bool is_immutable,
+                                   bool is_auto_incrementing,
                                    const void* default_value,
                                    const KuduColumnStorageAttributes& storage_attributes,
                                    const KuduColumnTypeAttributes& type_attributes,
@@ -766,6 +796,7 @@ KuduColumnSchema::KuduColumnSchema(const string &name,
   col_ = new ColumnSchema(name, ToInternalDataType(type, type_attributes),
                           is_nullable,
                           is_immutable,
+                          is_auto_incrementing,
                           default_value, default_value, attr_private,
                           type_attr_private, comment);
 }
@@ -843,8 +874,11 @@ KuduColumnStorageAttributes KuduColumnSchema::storage_attributes() const {
   KuduColumnStorageAttributes::StringToCompressionType(
       kudu::CompressionType_Name(storage_attributes.compression),
       &compression_type);
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
   return KuduColumnStorageAttributes(encoding_type, compression_type,
                                      storage_attributes.cfile_block_size);
+#pragma GCC diagnostic pop
 }
 
 const string& KuduColumnSchema::comment() const {
@@ -924,8 +958,8 @@ KuduColumnSchema KuduSchema::Column(size_t idx) const {
   KuduColumnTypeAttributes type_attrs(col.type_attributes().precision, col.type_attributes().scale,
                                       col.type_attributes().length);
   return KuduColumnSchema(col.name(), FromInternalDataType(col.type_info()->type()),
-                          col.is_nullable(), col.is_immutable(), col.read_default_value(),
-                          attrs, type_attrs, col.comment());
+                          col.is_nullable(), col.is_immutable(), col.is_auto_incrementing(),
+                          col.read_default_value(), attrs, type_attrs, col.comment());
 }
 
 bool KuduSchema::HasColumn(const std::string& col_name, KuduColumnSchema* col_schema) const {
@@ -933,7 +967,9 @@ bool KuduSchema::HasColumn(const std::string& col_name, KuduColumnSchema* col_sc
   if (idx == Schema::kColumnNotFound) {
     return false;
   }
-  *col_schema = Column(idx);
+  if (col_schema != nullptr) {
+    *col_schema = Column(idx);
+  }
   return true;
 }
 

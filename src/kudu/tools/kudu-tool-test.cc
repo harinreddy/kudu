@@ -123,6 +123,7 @@
 #include "kudu/tserver/tserver_admin.proxy.h"
 #include "kudu/util/async_util.h"
 #include "kudu/util/env.h"
+#include "kudu/util/jsonreader.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/net_util.h"
@@ -140,12 +141,16 @@
 #include "kudu/util/test_util.h"
 #include "kudu/util/url-coding.h"
 
+DECLARE_bool(enable_tablet_orphaned_block_deletion);
 DECLARE_bool(encrypt_data_at_rest);
+DECLARE_bool(disable_gflag_filter_logic_for_testing);
 DECLARE_bool(fs_data_dirs_consider_available_space);
 DECLARE_bool(hive_metastore_sasl_enabled);
 DECLARE_bool(show_values);
 DECLARE_bool(show_attributes);
 DECLARE_int32(catalog_manager_inject_latency_load_ca_info_ms);
+DECLARE_int32(flush_threshold_mb);
+DECLARE_int32(flush_threshold_secs);
 DECLARE_int32(heartbeat_interval_ms);
 DECLARE_int32(tserver_unresponsive_timeout_ms);
 DECLARE_int32(rpc_negotiation_inject_delay_ms);
@@ -227,6 +232,7 @@ using std::unique_ptr;
 using std::unordered_map;
 using std::unordered_set;
 using std::vector;
+using std::tuple;
 using strings::Substitute;
 
 namespace kudu {
@@ -740,6 +746,40 @@ class ToolTest : public KuduTest {
     return JoinStrings(master_addrs, ",");
   }
 
+  Status ListTabletRowsetIds(const string& metadata_path,
+                             const string& tablet_id,
+                             const string& encryption_args,
+                             set<int64_t>* rowset_ids) {
+    string stdout;
+    RunActionStdoutString(Substitute("pbc dump $0 $1 --json",
+                                     JoinPathSegments(metadata_path, tablet_id), encryption_args),
+                          &stdout);
+
+    JsonReader r(stdout);
+    RETURN_NOT_OK(r.Init());
+    vector<const rapidjson::Value*> results;
+    Status s = r.ExtractObjectArray(r.root(), "rowsets", &results);
+
+    rowset_ids->clear();
+    if (s.IsNotFound()) {
+      return Status::OK();
+    }
+    RETURN_NOT_OK(s);
+    LOG(INFO) << "results size: " << results.size();
+    for (const auto& result : results) {
+      string rowset_id_str;
+      RETURN_NOT_OK(r.ExtractString(result, "id", &rowset_id_str));
+      LOG(INFO) << "rowset_id_str: " << rowset_id_str;
+      int64_t rowset_id;
+      if (!safe_strto64(rowset_id_str, &rowset_id)) {
+        return Status::InvalidArgument(Substitute("invalid rowset id: $0", rowset_id_str));
+      }
+      InsertOrDie(rowset_ids, rowset_id);
+    }
+
+    return Status::OK();
+  }
+
  protected:
   // Note: Each test case must have a single invocation of RunLoadgen() otherwise it leads to
   //       memory leaks.
@@ -1235,6 +1275,7 @@ TEST_F(ToolTest, TestModeHelp) {
   {
     const vector<string> kDiagnoseModeRegexes = {
         "parse_stacks.*Parse sampled stack traces",
+        "parse_metrics.*Parse metrics out of a diagnostics log",
     };
     NO_FATALS(RunTestHelp("diagnose", kDiagnoseModeRegexes));
   }
@@ -1278,6 +1319,7 @@ TEST_F(ToolTest, TestModeHelp) {
   {
     const vector<string> kLocalReplicaModeRegexes = {
         "cmeta.*Operate on a local tablet replica's consensus",
+        "tmeta.*Edit a local tablet metadata",
         "data_size.*Summarize the data size",
         "dump.*Dump a Kudu filesystem",
         "copy_from_remote.*Copy tablet replicas from a remote server",
@@ -1326,6 +1368,12 @@ TEST_F(ToolTest, TestModeHelp) {
     // Try with hyphens instead of underscores.
     NO_FATALS(RunTestHelp("local-replica copy-from-local --help",
                           kLocalReplicaCopyFromRemoteRegexes));
+  }
+  {
+    const vector<string> kLocalReplicaTmetaRegexes = {
+        "delete_rowsets.*Delete rowsets from a local replica.",
+    };
+    NO_FATALS(RunTestHelp("local_replica tmeta", kLocalReplicaTmetaRegexes));
   }
   {
     const string kCmd = "master";
@@ -2797,8 +2845,8 @@ TEST_F(ToolTest, TestLocalReplicaOps) {
   {
     string stdout;
     NO_FATALS(RunActionStdoutString(
-        Substitute("local_replica dump rowset $0 $1 $2",
-                   kTestTablet, fs_paths, encryption_args), &stdout));
+        Substitute("local_replica dump rowset $0 $1 $2", kTestTablet, fs_paths, encryption_args),
+        &stdout));
 
     SCOPED_TRACE(stdout);
     ASSERT_STR_CONTAINS(stdout, "Dumping rowset 0");
@@ -2813,27 +2861,39 @@ TEST_F(ToolTest, TestLocalReplicaOps) {
     ASSERT_STR_CONTAINS(stdout, "undo_deltas {");
 
     ASSERT_STR_CONTAINS(stdout,
-                       "RowIdxInBlock: 0; Base: (int32 key=0, int32 int_val=0,"
-                       " string string_val=\"HelloWorld\"); "
-                       "Undo Mutations: [@1(DELETE)]; Redo Mutations: [];");
+                        "RowIdxInBlock: 0; Base: (int32 key=0, int32 int_val=0,"
+                        " string string_val=\"HelloWorld\"); "
+                        "Undo Mutations: [@1(DELETE)]; Redo Mutations: [];");
     ASSERT_STR_MATCHES(stdout, ".*---------------------.*");
-
+  }
+  {
     // This is expected to fail with Invalid argument for kRowId.
+    string stdout;
     string stderr;
-    Status s = RunTool(
-        Substitute("local_replica dump rowset $0 $1 --rowset_index=$2 $3",
-                   kTestTablet, fs_paths, kRowId, encryption_args),
-                   &stdout, &stderr, nullptr, nullptr);
+    Status s = RunTool(Substitute("local_replica dump rowset $0 $1 --rowset_index=$2 $3",
+                                  kTestTablet,
+                                  fs_paths,
+                                  kRowId,
+                                  encryption_args),
+                       &stdout,
+                       &stderr,
+                       nullptr,
+                       nullptr);
     ASSERT_TRUE(s.IsRuntimeError());
     SCOPED_TRACE(stderr);
-    string expected = "Could not find rowset " + SimpleItoa(kRowId) +
-        " in tablet id " + kTestTablet;
+    string expected =
+        "Could not find rowset " + SimpleItoa(kRowId) + " in tablet id " + kTestTablet;
     ASSERT_STR_CONTAINS(stderr, expected);
-
-    NO_FATALS(RunActionStdoutString(
-        Substitute("local_replica dump rowset --nodump_all_columns "
-                   "--nodump_metadata --nrows=15 $0 $1 $2",
-                   kTestTablet, fs_paths, encryption_args), &stdout));
+  }
+  {
+    // Dump rowsets' primary keys in comparable format.
+    string stdout;
+    NO_FATALS(RunActionStdoutString(Substitute("local_replica dump rowset --nodump_all_columns "
+                                               "--nodump_metadata --nrows=15 $0 $1 $2",
+                                               kTestTablet,
+                                               fs_paths,
+                                               encryption_args),
+                                    &stdout));
 
     SCOPED_TRACE(stdout);
     ASSERT_STR_CONTAINS(stdout, "Dumping rowset 0");
@@ -2843,6 +2903,50 @@ TEST_F(ToolTest, TestLocalReplicaOps) {
     for (int row_idx = 0; row_idx < 30; row_idx++) {
       string row_key = StringPrintf("800000%02x", row_idx);
       if (row_idx < 15) {
+        ASSERT_STR_CONTAINS(stdout, row_key);
+      } else {
+        ASSERT_STR_NOT_CONTAINS(stdout, row_key);
+      }
+    }
+  }
+
+  {
+    // Dump rowsets' primary keys in human readable format.
+    string stdout;
+    NO_FATALS(
+        RunActionStdoutString(Substitute("local_replica dump rowset --nodump_all_columns "
+                                         "--nodump_metadata --use_readable_format $0 $1 $2",
+                                         kTestTablet,
+                                         fs_paths,
+                                         encryption_args),
+                              &stdout));
+
+    SCOPED_TRACE(stdout);
+    ASSERT_STR_CONTAINS(stdout, "Dumping rowset 0");
+    ASSERT_STR_CONTAINS(stdout, "Dumping rowset 1");
+    ASSERT_STR_CONTAINS(stdout, "Dumping rowset 2");
+    ASSERT_STR_NOT_CONTAINS(stdout, "RowSet metadata");
+    for (int row_idx = 0; row_idx < 30; row_idx++) {
+      ASSERT_STR_CONTAINS(stdout, Substitute("(int32 key=$0)", row_idx));
+    }
+  }
+  {
+    // Dump rowsets' primary key bounds only.
+    string stdout;
+    NO_FATALS(RunActionStdoutString(
+        Substitute("local_replica dump rowset --nodump_all_columns "
+                   "--nodump_metadata --use_readable_format "
+                   "--dump_primary_key_bounds_only $0 $1 $2",
+                   kTestTablet, fs_paths, encryption_args), &stdout));
+
+    SCOPED_TRACE(stdout);
+    ASSERT_STR_CONTAINS(stdout, "Dumping rowset 0");
+    ASSERT_STR_CONTAINS(stdout, "Dumping rowset 1");
+    ASSERT_STR_CONTAINS(stdout, "Dumping rowset 2");
+    ASSERT_STR_NOT_CONTAINS(stdout, "RowSet metadata");
+    for (int row_idx = 0; row_idx < 30; row_idx++) {
+      string row_key = Substitute("(int32 key=$0)", row_idx);
+      if (row_idx % 10 == 0 || row_idx % 10 == 9) {
         ASSERT_STR_CONTAINS(stdout, row_key);
       } else {
         ASSERT_STR_NOT_CONTAINS(stdout, row_key);
@@ -2951,6 +3055,16 @@ TEST_F(ToolTest, TestLocalReplicaOps) {
     string stdout;
     NO_FATALS(RunActionStdoutString(Substitute("local_replica list $0 $1",
                                                fs_paths, encryption_args), &stdout));
+
+    SCOPED_TRACE(stdout);
+    ASSERT_STR_MATCHES(stdout, kTestTablet);
+  }
+
+  {
+    string stdout;
+    NO_FATALS(RunActionStdoutString(
+        Substitute("local_replica list $0 $1 --list_detail=true",
+                   fs_paths, encryption_args), &stdout));
 
     SCOPED_TRACE(stdout);
     ASSERT_STR_MATCHES(stdout, kTestTablet);
@@ -3065,13 +3179,13 @@ void ToolTest::RunLoadgen(int num_tservers,
         ColumnSchema("int64_val", INT64),
         ColumnSchema("float_val", FLOAT),
         ColumnSchema("double_val", DOUBLE),
-        ColumnSchema("decimal32_val", DECIMAL32, false, false,
+        ColumnSchema("decimal32_val", DECIMAL32, false, false, false,
                      nullptr, nullptr, ColumnStorageAttributes(),
                      ColumnTypeAttributes(9, 9)),
-        ColumnSchema("decimal64_val", DECIMAL64, false, false,
+        ColumnSchema("decimal64_val", DECIMAL64, false, false, false,
                      nullptr, nullptr, ColumnStorageAttributes(),
                      ColumnTypeAttributes(18, 2)),
-        ColumnSchema("decimal128_val", DECIMAL128, false, false,
+        ColumnSchema("decimal128_val", DECIMAL128, false, false, false,
                      nullptr, nullptr, ColumnStorageAttributes(),
                      ColumnTypeAttributes(38, 0)),
         ColumnSchema("unixtime_micros_val", UNIXTIME_MICROS),
@@ -4362,6 +4476,104 @@ TEST_F(ToolTest, TestLocalReplicaCMetaOps) {
   }
 }
 
+TEST_F(ToolTest, TestServerSetFlag) {
+  NO_FATALS(StartExternalMiniCluster());
+  string master_addr = cluster_->master()->bound_rpc_addr().ToString();
+  { // Test set unsafe flag.
+    NO_FATALS(RunActionStdoutNone(
+        Substitute("master set_flag $0 unlock_unsafe_flags true --force",
+                   master_addr)));
+    NO_FATALS(RunActionStdoutNone(
+        Substitute("master set_flag $0 enable_data_block_fsync true --force",
+                   master_addr)));
+    // Test invalid unsafe flag.
+    string err;
+    RunActionStderrString(
+        Substitute("master set_flag $0 unlock_unsafe_flags false --force",
+                   master_addr), &err);
+    ASSERT_STR_CONTAINS(err,
+        "Detected inconsistency in command-line flags");
+    // Flag value will not be changed.
+    string out;
+    RunActionStdoutString(
+        Substitute("master get_flags $0 --flags=unlock_unsafe_flags --format=json",
+                   master_addr), &out);
+    rapidjson::Document doc;
+    doc.Parse<0>(out.c_str());
+    const string flag_value = "true";
+    for (int i = 0; i < doc.Size(); i++) {
+      const rapidjson::Value& item = doc[i];
+      ASSERT_TRUE(item["value"].GetString() == flag_value);
+    }
+  }
+  { // Test set experimental flag.
+    NO_FATALS(RunActionStdoutNone(
+        Substitute("master set_flag $0 unlock_experimental_flags true --force",
+                   master_addr)));
+    NO_FATALS(RunActionStdoutNone(
+        Substitute("master set_flag $0 auto_rebalancing_enabled true --force",
+                   master_addr)));
+    // Test invalid experimental flag.
+    string err;
+    RunActionStderrString(
+        Substitute("master set_flag $0 unlock_experimental_flags false --force",
+                   master_addr), &err);
+    ASSERT_STR_CONTAINS(err,
+        "Detected inconsistency in command-line flags");
+    // Flag value will not be changed.
+    string out;
+    RunActionStdoutString(
+        Substitute("master get_flags $0 --flags=unlock_experimental_flags --format=json",
+                   master_addr), &out);
+    rapidjson::Document doc;
+    doc.Parse<0>(out.c_str());
+    const string flag_value = "true";
+    for (int i = 0; i < doc.Size(); i++) {
+      const rapidjson::Value& item = doc[i];
+      ASSERT_TRUE(item["value"].GetString() == flag_value);
+    }
+  }
+  { // Test set flag using group flag validator.
+    NO_FATALS(RunActionStdoutNone(
+        Substitute("master set_flag $0 unlock_experimental_flags true --force",
+                   master_addr)));
+    NO_FATALS(RunActionStdoutNone(
+        Substitute("master set_flag $0 raft_prepare_replacement_before_eviction true --force",
+                  master_addr)));
+    NO_FATALS(RunActionStdoutNone(
+        Substitute("master set_flag $0 auto_rebalancing_enabled true --force",
+                   master_addr)));
+    // Test set flag violating group validator.
+    string err;
+    RunActionStderrString(
+        Substitute("master set_flag $0 raft_prepare_replacement_before_eviction false --force",
+                   master_addr), &err);
+    NO_FATALS(RunActionStdoutNone(
+        Substitute("master set_flag $0 auto_rebalancing_enabled true --force",
+                   master_addr)));
+    ASSERT_STR_CONTAINS(err, "Detected inconsistency in command-line flags");
+    // Flag value will not be changed.
+    string out;
+    RunActionStdoutString(
+        Substitute("master get_flags $0 --flags=raft_prepare_replacement_before_eviction"
+                   " --format=json",
+                   master_addr), &out);
+    rapidjson::Document doc;
+    doc.Parse<0>(out.c_str());
+    const string flag_value = "true";
+    for (int i = 0; i < doc.Size(); i++) {
+      const rapidjson::Value& item = doc[i];
+      ASSERT_TRUE(item["value"].GetString() == flag_value);
+    }
+  }
+  { // Test set flag using parameter: --run_consistency_check.
+    NO_FATALS(RunActionStdoutNone(
+        Substitute("master set_flag $0 rpc_certificate_file test "
+                   "--force --run_consistency_check=false",
+                   master_addr)));
+  }
+}
+
 TEST_F(ToolTest, TestTserverList) {
   NO_FATALS(StartExternalMiniCluster());
 
@@ -4575,7 +4787,7 @@ TEST_F(ToolTest, TestDeleteTable) {
 
   // Delete the table.
   NO_FATALS(RunActionStdoutNone(Substitute(
-      "table delete $0 $1 --nomodify_external_catalogs -reserve_seconds=0",
+      "table delete $0 $1 --nomodify_external_catalogs",
       master_addr, kTableName)));
 
   // Check that the table does not exist.
@@ -4632,7 +4844,8 @@ TEST_F(ToolTest, TestRecallTable) {
   // Soft-delete the table.
   string out;
   NO_FATALS(RunActionStdoutNone(Substitute(
-      "table delete $0 $1 --reserve_seconds=300", master_addr, kTableName)));
+      "table delete $0 $1 --reserve_seconds=300",
+      master_addr, kTableName)));
 
   // List soft_deleted table.
   vector<string> kudu_tables;
@@ -7701,8 +7914,22 @@ TEST_F(ToolTest, TestReplaceTablet) {
   ASSERT_GE(workload.rows_inserted(), CountTableRows(workload_table.get()));
 }
 
-TEST_F(ToolTest, TestGetFlags) {
+class GetFlagsTest :
+    public ToolTest,
+    public ::testing::WithParamInterface<bool> {
+};
+
+INSTANTIATE_TEST_SUITE_P(DisableFlagFilterLogic, GetFlagsTest, ::testing::Bool());
+TEST_P(GetFlagsTest, TestGetFlags) {
   ExternalMiniClusterOptions opts;
+  const string disable_flag_filter_logic_on_server =
+      Substitute("--disable_gflag_filter_logic_for_testing=$0", GetParam());
+  opts.extra_master_flags = {
+    disable_flag_filter_logic_on_server,
+  };
+  opts.extra_tserver_flags = {
+    disable_flag_filter_logic_on_server,
+  };
   opts.num_tablet_servers = 1;
   NO_FATALS(StartExternalMiniCluster(std::move(opts)));
 
@@ -7837,9 +8064,70 @@ TEST_F(ToolTest, TestParseStacks) {
   Status s = RunActionStderrString(
       Substitute("diagnose parse_stacks $0", kBadDataPath),
       &stderr);
-  ASSERT_TRUE(s.IsRuntimeError());
-  ASSERT_STR_MATCHES(stderr, "failed to parse stacks from .*: at line 1: "
+  ASSERT_TRUE(s.IsRuntimeError()) << s.ToString();
+  ASSERT_STR_MATCHES(stderr, "failed to parse stacks from .* line 1.*"
                              "invalid JSON payload.*Missing a closing quotation mark in string");
+}
+
+TEST_F(ToolTest, TestParseMetrics) {
+  const string kDataPath = JoinPathSegments(GetTestExecutableDirectory(),
+                                            "testdata/sample-diagnostics-log.txt");
+  const string kBadDataPath = JoinPathSegments(GetTestExecutableDirectory(),
+                                               "testdata/bad-diagnostics-log.txt");
+  // Check out tablet metrics.
+  {
+    string stdout;
+    NO_FATALS(RunActionStdoutString(
+        Substitute("diagnose parse_metrics $0 -simple-metrics=tablet.on_disk_size:size_bytes "
+                   "-rate-metrics=tablet.on_disk_size:bytes_rate", kDataPath),
+        &stdout));
+    // Spot check a few of the things that should be in the output.
+    ASSERT_STR_CONTAINS(stdout, "timestamp\tsize_bytes\tbytes_rate");
+    ASSERT_STR_CONTAINS(stdout, "1521053715220449\t69705682\t0");
+    ASSERT_STR_CONTAINS(stdout, "1521053775220513\t69705682\t0");
+    ASSERT_STR_CONTAINS(stdout, "1521053835220611\t69712809\t118.78313932087244");
+    ASSERT_STR_CONTAINS(stdout, "1521053895220710\t69712809\t0");
+    ASSERT_STR_CONTAINS(stdout, "1661840031227204\t69712809\t0");
+  }
+  // Check out table metrics.
+  {
+    string stdout;
+    NO_FATALS(RunActionStdoutString(
+        Substitute("diagnose parse_metrics $0 "
+                   "-simple-metrics=table.on_disk_size:size,table.live_row_count:row_count",
+                   kDataPath),
+        &stdout));
+    // Spot check a few of the things that should be in the output.
+    ASSERT_STR_CONTAINS(stdout, "timestamp\trow_count\tsize");
+    ASSERT_STR_CONTAINS(stdout, "1521053715220449\t0\t0");
+    ASSERT_STR_CONTAINS(stdout, "1521053775220513\t0\t0");
+    ASSERT_STR_CONTAINS(stdout, "1521053835220611\t0\t0");
+    ASSERT_STR_CONTAINS(stdout, "1521053895220710\t0\t0");
+    ASSERT_STR_CONTAINS(stdout, "1661840031227204\t228265\t78540528");
+  }
+  // Check out table metrics with default metric names.
+  {
+    string stdout;
+    NO_FATALS(RunActionStdoutString(
+        Substitute("diagnose parse_metrics $0 "
+                   "-simple-metrics=table.on_disk_size,table.live_row_count",
+                   kDataPath),
+        &stdout));
+    // Spot check a few of the things that should be in the output.
+    ASSERT_STR_CONTAINS(stdout, "timestamp\tlive_row_count\ton_disk_size");
+    ASSERT_STR_CONTAINS(stdout, "1521053715220449\t0\t0");
+    ASSERT_STR_CONTAINS(stdout, "1521053775220513\t0\t0");
+    ASSERT_STR_CONTAINS(stdout, "1521053835220611\t0\t0");
+    ASSERT_STR_CONTAINS(stdout, "1521053895220710\t0\t0");
+    ASSERT_STR_CONTAINS(stdout, "1661840031227204\t228265\t78540528");
+  }
+
+  string stderr;
+  ASSERT_OK(RunActionStderrString(
+      Substitute("diagnose parse_metrics $0 -simple-metrics=tablet.on_disk_size:size",
+      kBadDataPath), &stderr));
+  ASSERT_STR_MATCHES(stderr, "Skipping file.*invalid JSON payload.*Missing "
+                             "a closing quotation mark in string");
 }
 
 TEST_F(ToolTest, ClusterNameResolverEnvNotSet) {
@@ -8526,6 +8814,116 @@ TEST_F(ToolTest, TestRebuildTserverByLocalReplicaCopy) {
   });
 }
 
+// Test for 'local_replica tmeta' functionality.
+TEST_F(ToolTest, TestLocalReplicaTmeta) {
+  constexpr const char* const kTableName = "kudu.local_replica.tmeta";
+  const int kNumTablets = 4;
+  const int kNumTabletServers = 1;
+
+  FLAGS_flush_threshold_mb = 1;
+  FLAGS_flush_threshold_secs = 1;
+  InternalMiniClusterOptions opts;
+  opts.num_tablet_servers = kNumTabletServers;
+  NO_FATALS(StartMiniCluster(std::move(opts)));
+
+  TestWorkload workload(mini_cluster_.get());
+  workload.set_num_tablets(kNumTablets);
+  workload.set_num_replicas(1);
+  workload.set_table_name(kTableName);
+  workload.Setup();
+  workload.Start();
+  // Make sure there are some rowsets flushed.
+  SleepFor(MonoDelta::FromSeconds(2));
+  workload.StopAndJoin();
+  int64_t total_row_count = workload.rows_inserted();
+
+  string encryption_args;
+  if (env_->IsEncryptionEnabled()) {
+    encryption_args =
+        GetEncryptionArgs() + " --instance_file=" +
+        JoinPathSegments(mini_cluster_->mini_tablet_server(0)->options()->fs_opts.wal_root,
+                         "instance");
+  }
+  const string& flags =
+      Substitute("-fs_wal_dir=$0 --fs_data_dirs=$1 $2",
+                 mini_cluster_->mini_tablet_server(0)->options()->fs_opts.wal_root,
+                 JoinStrings(mini_cluster_->mini_tablet_server(0)->options()->fs_opts.data_roots,
+                             ","),
+                 encryption_args);
+
+  // Find the tablet to edit.
+  vector<string> tablet_ids;
+  NO_FATALS(RunActionStdoutLines(Substitute("local_replica list $0", flags), &tablet_ids));
+  ASSERT_EQ(kNumTablets, tablet_ids.size());
+  const string& tablet_id = tablet_ids[0];
+  const string& metadata_path = mini_cluster_->mini_tablet_server(0)->server()
+                                    ->fs_manager()->GetTabletMetadataDir();
+  const string& original_file = JoinPathSegments(metadata_path, tablet_id);
+
+  // The server should be shutdown before editing.
+  string stdout;
+  string stderr;
+  Status s = RunActionStdoutStderrString(
+      Substitute("local_replica tmeta delete_rowsets $0 $1 $2", tablet_id, 0, flags),
+      &stdout, &stderr);
+  ASSERT_TRUE(s.IsRuntimeError()) << s.ToString();
+  ASSERT_STR_CONTAINS(stderr, "failed to load instance files");
+
+  // List rowsets after server shutdown, the rowsets set will not change if not edit the tablet
+  // metadata.
+  mini_cluster_->Shutdown();
+  set<int64_t> rowset_ids;
+  ASSERT_OK(ListTabletRowsetIds(metadata_path, tablet_id, encryption_args, &rowset_ids));
+  ASSERT_FALSE(rowset_ids.empty());
+  int64_t rowset_id_to_delete = *rowset_ids.begin();
+
+  // Remove one rowset from the tablet.
+  ASSERT_OK(RunActionStdoutStderrString(
+      Substitute("local_replica tmeta delete_rowsets $0 $1 $2 --backup_metadata=true "
+                 "--enable_tablet_orphaned_block_deletion=false",
+                 tablet_id, rowset_id_to_delete, flags),
+      &stdout, &stderr));
+
+  // Check the rowset has been deleted successfully.
+  set<int64_t> new_rowset_ids;
+  ASSERT_OK(ListTabletRowsetIds(metadata_path, tablet_id, encryption_args, &new_rowset_ids));
+  ASSERT_EQ(rowset_ids.size() - 1, new_rowset_ids.size());
+  ASSERT_FALSE(ContainsKey(new_rowset_ids, rowset_id_to_delete));
+
+  // The server can be started successfully.
+  // Disable orphaned blocks deletion, because we will roll back to check the original data.
+  FLAGS_enable_tablet_orphaned_block_deletion = false;
+  ASSERT_OK(mini_cluster_->Start());
+  ASSERT_EVENTUALLY([&] {
+    ClusterVerifier v(mini_cluster_.get());
+    NO_FATALS(v.CheckRowCount(kTableName, ClusterVerifier::AT_LEAST, 1));
+  });
+
+  // Roll back the metadata and restart server.
+  mini_cluster_->Shutdown();
+  string backup_file;
+  vector<string> metadata_files;
+  ASSERT_OK(env_->GetChildren(metadata_path, &metadata_files));
+  for (const auto& metadata_file : metadata_files) {
+    if (MatchPattern(metadata_file, Substitute("*$0.bak.*", tablet_id))) {
+      backup_file = metadata_file;
+      break;
+    }
+  }
+  ASSERT_FALSE(backup_file.empty());
+  ASSERT_OK(env_->RenameFile(JoinPathSegments(metadata_path, backup_file), original_file));
+  // Now it's safe to enable orphaned blocks deletion, because there is no orphaned blocks in
+  // original tablet metadata file.
+  FLAGS_enable_tablet_orphaned_block_deletion = true;
+  ASSERT_OK(mini_cluster_->Start());
+
+  // Check there isn't any data loss.
+  ASSERT_EVENTUALLY([&] {
+    ClusterVerifier v(mini_cluster_.get());
+    NO_FATALS(v.CheckRowCount(kTableName, ClusterVerifier::EXACTLY, total_row_count));
+  });
+}
+
 class SetFlagForAllTest :
     public ToolTest,
     public ::testing::WithParamInterface<bool> {
@@ -8551,46 +8949,57 @@ TEST_P(SetFlagForAllTest, TestSetFlagForAll) {
     master_addresses.emplace_back(cluster_->master(i)->bound_rpc_addr().ToString());
   }
   string str_master_addresses = JoinMapped(master_addresses, [](string addr){return addr;}, ",");
-  const string flag_key = "max_log_size";
-  const string flag_value = "10";
-  NO_FATALS(RunActionStdoutNone(
-      Substitute("$0 set_flag_for_all $1 $2 $3",
-          role, str_master_addresses, flag_key, flag_value)));
 
-  int hosts_num = is_master? opts.num_masters : opts.num_tablet_servers;
-  string out;
-  for (int i = 0; i < hosts_num; i++) {
-    if (is_master) {
-      NO_FATALS(RunActionStdoutString(
-          Substitute("$0 get_flags $1 --format=json", role,
-              cluster_->master(i)->bound_rpc_addr().ToString()),
-              &out));
-    } else {
-      NO_FATALS(RunActionStdoutString(
-          Substitute("$0 get_flags $1 --format=json", role,
-          cluster_->tablet_server(i)->bound_rpc_addr().ToString()),
-          &out));
-    }
-    rapidjson::Document doc;
-    doc.Parse<0>(out.c_str());
-    for (int i = 0; i < doc.Size(); i++) {
-      const rapidjson::Value& item = doc[i];
-      ASSERT_TRUE(item["flag"].IsString());
-      if (item["flag"].GetString() == flag_key) {
-        ASSERT_TRUE(item["value"].IsString());
-        ASSERT_TRUE(item["value"].GetString() == flag_value);
-        return;
+  // <flag key, flag value, optional parameter>
+  vector<tuple<string , string , string>> command_parameters;
+  command_parameters.emplace_back(tuple<string, string, string>("max_log_size", "10" , ""));
+  command_parameters.emplace_back(tuple<string, string, string>("log_async", "false" , "--force"));
+
+  for (auto command_parameter : command_parameters) {
+    const string flag_key = std::get<0>(command_parameter);
+    const string flag_value = std::get<1>(command_parameter);
+    const string optional_parameter = std::get<2>(command_parameter);
+    NO_FATALS(RunActionStdoutNone(
+        Substitute("$0 set_flag_for_all $1 $2 $3 $4",
+            role, str_master_addresses, flag_key, flag_value, optional_parameter)));
+
+    int hosts_num = is_master? opts.num_masters : opts.num_tablet_servers;
+    string out;
+    for (int i = 0; i < hosts_num; i++) {
+      if (is_master) {
+        NO_FATALS(RunActionStdoutString(
+            Substitute("$0 get_flags $1 --format=json", role,
+                cluster_->master(i)->bound_rpc_addr().ToString()),
+                &out));
+      } else {
+        NO_FATALS(RunActionStdoutString(
+            Substitute("$0 get_flags $1 --format=json", role,
+            cluster_->tablet_server(i)->bound_rpc_addr().ToString()),
+            &out));
+      }
+      rapidjson::Document doc;
+      doc.Parse<0>(out.c_str());
+      for (int i = 0; i < doc.Size(); i++) {
+        const rapidjson::Value& item = doc[i];
+        ASSERT_TRUE(item["flag"].IsString());
+        if (item["flag"].GetString() == flag_key) {
+          ASSERT_TRUE(item["value"].IsString());
+          ASSERT_TRUE(item["value"].GetString() == flag_value);
+          break;
+        }
       }
     }
   }
 
   // A test for setting a non-existing flag.
+  string stdout;
+  string stderr;
   Status s = RunTool(
-      Substitute("$0 set_flag_for_all $2 test_flag test_value",
+      Substitute("$0 set_flag_for_all $1 test_flag test_value",
           role, str_master_addresses),
-      nullptr, nullptr, nullptr, nullptr);
+      &stdout, &stderr, nullptr, nullptr);
   ASSERT_TRUE(s.IsRuntimeError());
-  ASSERT_STR_CONTAINS(s.ToString(), "set flag failed");
+  ASSERT_STR_CONTAINS(stderr, "result: NO_SUCH_FLAG");
 }
 
 } // namespace tools

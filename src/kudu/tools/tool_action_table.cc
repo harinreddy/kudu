@@ -93,6 +93,7 @@ using std::endl;
 using std::find_if;
 using std::make_unique;
 using std::map;
+using std::nullopt;
 using std::ostringstream;
 using std::pair;
 using std::set;
@@ -198,9 +199,9 @@ DEFINE_bool(show_avro_format_schema, false,
             "Display the table schema in avro format. When enabled it only outputs the "
             "table schema in Avro format without any other information like "
             "partition/owner/comments. It cannot be used in conjunction with other flags");
-DEFINE_uint32(reserve_seconds, 0,
+DEFINE_int32(reserve_seconds, -1,
               "Grace period before purging a soft-deleted table, in seconds. "
-              "If set to 0, table is purged once it dropped/deleted.");
+              "If set to 0, it would be purged when a table is dropped/deleted.");
 
 DECLARE_bool(create_table);
 DECLARE_bool(fault_tolerant);
@@ -579,7 +580,7 @@ Status DescribeTable(const RunnerContext& context) {
   const KuduSchema& schema = table->schema();
   if (FLAGS_show_avro_format_schema) {
     return PopulateAvroSchema(FindOrDie(context.required_args, kTableNameArg),
-                                         client->cluster_id(), schema);
+                                        client->cluster_id(), schema);
   }
   cout << "TABLE " << table_name << " " << schema.ToString() << endl;
   // The partition schema with current range partitions.
@@ -656,6 +657,7 @@ Status LocateRow(const RunnerContext& context) {
       case KuduColumnSchema::INT32:
       case KuduColumnSchema::INT64:
       case KuduColumnSchema::DATE:
+      case KuduColumnSchema::SERIAL:
       case KuduColumnSchema::UNIXTIME_MICROS: {
         int64_t value;
         RETURN_NOT_OK_PREPEND(
@@ -993,6 +995,14 @@ Status ConvertToKuduPartialRow(
             reader.ExtractInt64(values[i], /*field=*/nullptr, &value),
             error_msg);
         RETURN_NOT_OK(range_bound_partial_row->SetInt64(col_name, value));
+        break;
+      }
+      case KuduColumnSchema::SERIAL: {
+        uint64_t value;
+        RETURN_NOT_OK_PREPEND(
+            reader.ExtractUint64(values[i], /*field=*/nullptr, &value),
+            error_msg);
+        RETURN_NOT_OK(range_bound_partial_row->SetSerial(col_name, value));
         break;
       }
       case KuduColumnSchema::DATE: {

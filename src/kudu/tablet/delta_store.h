@@ -384,6 +384,10 @@ class DeltaIterator : public PreparedDeltas {
   // See SelectedDeltas::Delta for more details.
   virtual void set_deltas_selected(int64_t deltas_selected) = 0;
 
+  // Return an estimate on the maximum amount of memory a DeltaIterator object
+  // uses during its lifecycle while initializing, preparing next batch, etc.
+  virtual size_t memory_footprint() = 0;
+
   virtual ~DeltaIterator() {}
 };
 
@@ -546,7 +550,7 @@ class DeltaPreparer : public PreparedDeltas {
     DeltaKey key;
     Slice val;
   };
-  std::vector<PreparedDelta> prepared_deltas_;
+  std::deque<PreparedDelta> prepared_deltas_;
 
   // State when prepared_for_ & PREPARED_FOR_SELECT
   // ------------------------------------------------------------

@@ -141,6 +141,7 @@ DECLARE_bool(allow_unsafe_replication_factor);
 DECLARE_bool(catalog_manager_support_live_row_count);
 DECLARE_bool(catalog_manager_support_on_disk_size);
 DECLARE_bool(client_use_unix_domain_sockets);
+DECLARE_bool(enable_rowset_compaction);
 DECLARE_bool(enable_txn_system_client_init);
 DECLARE_bool(fail_dns_resolution);
 DECLARE_bool(location_mapping_by_uuid);
@@ -217,6 +218,7 @@ using kudu::client::sp::shared_ptr;
 using kudu::tablet::TabletReplica;
 using kudu::transactions::TxnTokenPB;
 using kudu::tserver::MiniTabletServer;
+using std::atomic;
 using std::function;
 using std::map;
 using std::nullopt;
@@ -384,7 +386,8 @@ class ClientTest : public KuduTest {
         cluster_->mini_master()->master()->catalog_manager();
     CatalogManager::ScopedLeaderSharedLock l(catalog);
     CHECK_OK(l.first_failed_status());
-    CHECK_OK(catalog->GetTableLocations(&req, &resp, /*user=*/nullopt));
+    CHECK_OK(catalog->GetTableLocations(
+        &req, &resp, /*use_external_addr=*/false, /*user=*/nullopt));
     CHECK(resp.tablet_locations_size() > 0);
     return resp.tablet_locations(0).tablet_id();
   }
@@ -398,6 +401,68 @@ class ClientTest : public KuduTest {
                   RpcsQueueOverflowMetric()->value());
       }
     }
+  }
+
+  void CheckTokensInfo(const vector<KuduScanToken*>& tokens,
+                       int replica_num = 1) {
+    for (const auto* t : tokens) {
+      const KuduTablet& tablet = t->tablet();
+      ASSERT_EQ(replica_num, tablet.replicas().size());
+      const KuduReplica* replica = tablet.replicas()[0];
+      ASSERT_TRUE(replica->is_leader());
+      const MiniTabletServer* ts = cluster_->mini_tablet_server(0);
+      ASSERT_EQ(ts->server()->instance_pb().permanent_uuid(),
+          replica->ts().uuid());
+      ASSERT_EQ(ts->bound_rpc_addr().host(), replica->ts().hostname());
+      ASSERT_EQ(ts->bound_rpc_addr().port(), replica->ts().port());
+
+      unique_ptr<KuduTablet> tablet_copy;
+      {
+        KuduTablet* ptr;
+        ASSERT_OK(client_->GetTablet(tablet.id(), &ptr));
+        tablet_copy.reset(ptr);
+      }
+      ASSERT_EQ(tablet.id(), tablet_copy->id());
+      ASSERT_EQ(1, tablet_copy->replicas().size());
+      const KuduReplica* replica_copy = tablet_copy->replicas()[0];
+
+      ASSERT_EQ(replica->is_leader(), replica_copy->is_leader());
+      ASSERT_EQ(replica->ts().uuid(), replica_copy->ts().uuid());
+      ASSERT_EQ(replica->ts().hostname(), replica_copy->ts().hostname());
+      ASSERT_EQ(replica->ts().port(), replica_copy->ts().port());
+    }
+  }
+
+  int CountRows(const vector<KuduScanToken*>& tokens) {
+    atomic<uint32_t> rows(0);
+    vector<thread> threads;
+    for (KuduScanToken* token : tokens) {
+      string buf;
+      CHECK_OK(token->Serialize(&buf));
+
+      threads.emplace_back([this, &rows] (const string& serialized_token) {
+        shared_ptr<KuduClient> client;
+        ASSERT_OK(cluster_->CreateClient(nullptr, &client));
+        KuduScanner* scanner_ptr;
+        ASSERT_OK(KuduScanToken::DeserializeIntoScanner(
+            client.get(), serialized_token, &scanner_ptr));
+        unique_ptr<KuduScanner> scanner(scanner_ptr);
+        ASSERT_OK(scanner->Open());
+
+        while (scanner->HasMoreRows()) {
+          KuduScanBatch batch;
+          ASSERT_OK(scanner->NextBatch(&batch));
+          rows += batch.NumRows();
+        }
+        scanner->Close();
+      }, std::move(buf));
+    }
+
+    for (thread& thread : threads) {
+      thread.join();
+    }
+
+    return rows;
   }
 
   // Return the number of lookup-related RPCs which have been serviced by the master.
@@ -905,6 +970,51 @@ class ClientTest : public KuduTest {
   shared_ptr<KuduClient> client_;
   shared_ptr<KuduTable> client_table_;
 };
+
+// The goal of this test is to check a scenario where RPC timeout occurred, but session timeout
+// didn't. It verifies that by creating an artificial latency in tablet lookup that makes the RPC
+// call timeout and the client retries. After some time, the latency is set back to zero and client
+// has a successful operation without session timeout, even though the RPC timed out at least once.
+// This is the implementation for KUDU-1698.
+TEST_F(ClientTest, TestDefaultRPCTimeoutSessionTimeoutDifferent) {
+  SKIP_IF_SLOW_NOT_ALLOWED();
+  shared_ptr<KuduTable> table;
+  ASSERT_OK(CreateTable("rpctimeouttest", 1, {}, {}, &table));
+  constexpr int rpcTimeoutMs = 3000;
+  // Tablet lookup will trigger timeout.
+  FLAGS_master_inject_latency_on_tablet_lookups_ms = rpcTimeoutMs * 2;
+
+  CountDownLatch latch(1);
+
+  thread set_timeout_back_to_zero([&]() {
+    const auto sleep_interval = MonoDelta::FromMilliseconds(rpcTimeoutMs * 2L);
+    latch.WaitFor(sleep_interval);
+    // After some time, tablet lookup will be fast enough to be successful.
+    FLAGS_master_inject_latency_on_tablet_lookups_ms = 0;
+  });
+  SCOPED_CLEANUP({
+    latch.CountDown();
+    set_timeout_back_to_zero.join();
+  });
+
+  KuduClientBuilder builder;
+  builder.connection_negotiation_timeout(MonoDelta::FromMilliseconds(rpcTimeoutMs / 2));
+  builder.default_rpc_timeout(MonoDelta::FromMilliseconds(rpcTimeoutMs));
+  ASSERT_OK(cluster_->CreateClient(&builder, &client_));
+  const shared_ptr<KuduSession> session = client_->NewSession();
+  session->SetTimeoutMillis(rpcTimeoutMs * 3);
+
+  auto ent = cluster_->mini_master()->master()->metric_entity();
+  auto tablelocation_request_count =
+      METRIC_handler_latency_kudu_master_MasterService_GetTableLocations.Instantiate(ent)
+          ->TotalCount();
+  ASSERT_OK(session->Apply(BuildTestInsert(table.get(), 2).release()));
+  // Check that there were more than one tries which indicates RPC timeout and retry.
+  ASSERT_LT(1,
+            METRIC_handler_latency_kudu_master_MasterService_GetTableLocations.Instantiate(ent)
+                    ->TotalCount() -
+                tablelocation_request_count);
+}
 
 TEST_F(ClientTest, TestClusterId) {
   int leader_idx;
@@ -3195,10 +3305,7 @@ static Status ApplyUpsertToSession(KuduSession* session,
   RETURN_NOT_OK(upsert->mutable_row()->SetInt32("key", row_key));
   RETURN_NOT_OK(upsert->mutable_row()->SetInt32("int_val", int_val));
   RETURN_NOT_OK(upsert->mutable_row()->SetStringCopy("string_val", string_val));
-  // Here we use the first column to initialize an object of KuduColumnSchema
-  // for there is no default constructor for it.
-  KuduColumnSchema col_schema = table->schema().Column(0);
-  if (table->schema().HasColumn("imm_val", &col_schema)) {
+  if (table->schema().HasColumn("imm_val", nullptr)) {
     if (imm_val) {
       RETURN_NOT_OK(upsert->mutable_row()->SetInt32("imm_val", *imm_val));
     } else {
@@ -5102,8 +5209,8 @@ TEST_F(ClientTest, TestSoftDeleteAndReserveTable) {
     // Not allowed to delete the soft_deleted table with new reserve_seconds value.
     s = client_->SoftDeleteTable(kTableName, 600);
     ASSERT_TRUE(s.IsInvalidArgument());
-    ASSERT_STR_CONTAINS(s.ToString(), Substitute("soft_deleted table $0 should not be deleted",
-                                                 kTableName));
+    ASSERT_STR_CONTAINS(s.ToString(),
+        Substitute("soft_deleted table $0 should not be soft deleted again", kTableName));
   }
 
   {
@@ -5355,8 +5462,14 @@ TEST_F(ClientTest, TestDeleteSoftDeleteStatusFromDeletedTableReserveSeconds) {
   ASSERT_OK(client_->ListTables(&tables));
   ASSERT_TRUE(tables.empty());
 
+  // The behavior of DeleteTable turn to soft-delete
+  // soft-deleted table should not be soft deleted
+  Status s = client_->DeleteTable(kTableName);
+  ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+  ASSERT_STR_CONTAINS(s.ToString(),
+      Substitute("soft_deleted table $0 should not be soft deleted again", kTableName));
   // purge the soft-deleted table
-  ASSERT_OK(client_->DeleteTable(kTableName));
+  ASSERT_OK(client_->SoftDeleteTable(kTableName, 0));
 
   // No tables left.
   ASSERT_OK(client_->ListTables(&tables));
@@ -8533,6 +8646,171 @@ TEST_F(ClientTest, NoTxnManager) {
   }
 }
 
+class TableKeyRangeTest : public ClientTest {
+ public:
+   Status BuildSchema() override {
+    KuduSchemaBuilder b;
+    b.AddColumn("key")->Type(KuduColumnSchema::INT32)->NotNull()->PrimaryKey();
+    b.AddColumn("int_val")->Type(KuduColumnSchema::INT32)->NotNull();
+    b.AddColumn("string_val")->Type(KuduColumnSchema::STRING)->Nullable();
+    return b.Build(&schema_);
+  }
+
+  void SetUp() override {
+    ClientTest::SetUp();
+
+    // Set a low flush threshold so we can scan a mix of flushed data in
+    // in-memory data.
+    FLAGS_flush_threshold_mb = 0;
+    FLAGS_flush_threshold_secs = 1;
+
+    // Disable rowset compact to prevent DRSs being merged because they are too small.
+    FLAGS_enable_rowset_compaction = false;
+
+    ASSERT_OK(CreateTable(kTableName, 1, {}, GeneratePartialRows(), &client_table_));
+  }
+
+  typedef vector<pair<unique_ptr<KuduPartialRow>, unique_ptr<KuduPartialRow>>> KuduPartialRowsVec;
+  KuduPartialRowsVec GeneratePartialRows() const {
+    KuduPartialRowsVec rows;
+    vector<int> keys = { 0, 250, 500, 750 };
+    for (int i = 0; i < keys.size(); i++) {
+      unique_ptr<KuduPartialRow> lower_bound(schema_.NewRow());
+      CHECK_OK(lower_bound->SetInt32("key", keys[i]));
+      unique_ptr<KuduPartialRow> upper_bound(schema_.NewRow());
+      CHECK_OK(upper_bound->SetInt32("key", keys[i] + 250));
+      rows.emplace_back(lower_bound.release(), upper_bound.release());
+    }
+
+    return rows;
+  }
+
+  static void InsertTestRowsWithStrings(KuduTable* table, KuduSession* session, int num_rows) {
+    vector<int> keys = { 0, 250, 500, 750 };
+    string str_val = "*";
+    int diff_value = 120; // use to create discontinuous data in a tablet
+    for (int k = 0; k < keys.size(); k++) {
+      for (int i = keys[k]; i < keys[k] + num_rows; i++) {
+        unique_ptr<KuduInsert> insert(table->NewInsert());
+        ASSERT_OK(insert->mutable_row()->SetInt32("key", i));
+        ASSERT_OK(insert->mutable_row()->SetInt32("int_val", i * 2));
+        ASSERT_OK(insert->mutable_row()->SetString("string_val", str_val));
+        ASSERT_OK(session->Apply(insert.release()));
+        ASSERT_OK(session->Flush());
+      }
+      for (int i = keys[k] + diff_value; i < keys[k] + diff_value + num_rows; i++) {
+        unique_ptr<KuduInsert> insert(table->NewInsert());
+        ASSERT_OK(insert->mutable_row()->SetInt32("key", i));
+        ASSERT_OK(insert->mutable_row()->SetInt32("int_val", i * 2));
+        ASSERT_OK(insert->mutable_row()->SetString("string_val", str_val));
+        ASSERT_OK(session->Apply(insert.release()));
+        ASSERT_OK(session->Flush());
+      }
+    }
+  }
+
+ protected:
+  static constexpr const char* const kTableName = "client-testrange";
+
+  shared_ptr<KuduTable> range_table_;
+};
+
+TEST_F(TableKeyRangeTest, TestGetTableKeyRange) {
+  client::sp::shared_ptr<KuduTable> table;
+  ASSERT_OK(client_->OpenTable(kTableName, &table));
+  {
+    // Create session
+    shared_ptr<KuduSession> session = client_->NewSession();
+    session->SetTimeoutMillis(10000);
+    ASSERT_OK(session->SetFlushMode(KuduSession::MANUAL_FLUSH));
+
+    // Should have no rows to begin with.
+    ASSERT_EQ(0, CountRowsFromClient(table.get()));
+    // Insert rows
+    NO_FATALS(InsertTestRowsWithStrings(client_table_.get(), session.get(), 100));
+    NO_FATALS(CheckNoRpcOverflow());
+  }
+
+  {
+    // search meta cache by default
+    //
+    // There are tablet information in the meta cache.
+    // We give priority to the data in the cache by default.
+    KuduScanTokenBuilder builder(table.get());
+    vector<KuduScanToken*> tokens;
+    ElementDeleter deleter(&tokens);
+    ASSERT_OK(builder.Build(&tokens));
+    ASSERT_EQ(4, tokens.size());
+
+    NO_FATALS(CheckTokensInfo(tokens));
+    ASSERT_EQ(800, CountRows(tokens));
+  }
+
+  {
+    // search meta cache by local
+    //
+    // If the splitSizeBytes set to 0 , we search the meta cache.
+    KuduScanTokenBuilder builder(table.get());
+    vector<KuduScanToken*> tokens;
+    ElementDeleter deleter(&tokens);
+    // set splitSizeBytes to 0
+    builder.SetSplitSizeBytes(0);
+    ASSERT_OK(builder.Build(&tokens));
+    ASSERT_EQ(4, tokens.size());
+
+    NO_FATALS(CheckTokensInfo(tokens));
+    ASSERT_EQ(800, CountRows(tokens));
+  }
+
+  uint32_t token_size_a = 0;
+  {
+    // search from tserver
+    KuduScanTokenBuilder builder(table.get());
+    vector<KuduScanToken*> tokens;
+    ElementDeleter deleter(&tokens);
+    // set splitSizeBytes < tablet's size
+    builder.SetSplitSizeBytes(700);
+    ASSERT_OK(builder.Build(&tokens));
+    token_size_a = tokens.size();
+    ASSERT_LT(4, token_size_a);
+
+    NO_FATALS(CheckTokensInfo(tokens));
+    ASSERT_EQ(800, CountRows(tokens));
+  }
+
+  uint32_t token_size_b = 0;
+  {
+    // search from tserver
+    KuduScanTokenBuilder builder(table.get());
+    vector<KuduScanToken*> tokens;
+    ElementDeleter deleter(&tokens);
+    // set splitSizeBytes < tablet's size
+    builder.SetSplitSizeBytes(20);
+    ASSERT_OK(builder.Build(&tokens));
+    token_size_b = tokens.size();
+    ASSERT_LT(4, token_size_b);
+
+    NO_FATALS(CheckTokensInfo(tokens));
+    ASSERT_EQ(800, CountRows(tokens));
+  }
+
+  // diffferent splitSizeBytes leads to different token
+  ASSERT_NE(token_size_a, token_size_b);
+
+  {
+    // search from tserver
+    KuduScanTokenBuilder builder(table.get());
+    vector<KuduScanToken*> tokens;
+    ElementDeleter deleter(&tokens);
+    // set splitSizeBytes > tablet's size
+    builder.SetSplitSizeBytes(1024 * 1024 * 1024);
+    ASSERT_OK(builder.Build(&tokens));
+    ASSERT_EQ(tokens.size(), 4);
+
+    NO_FATALS(CheckTokensInfo(tokens));
+    ASSERT_EQ(800, CountRows(tokens));
+  }
+}
 class ClientTxnManagerProxyTest : public ClientTest {
  public:
   void SetUp() override {
@@ -9559,5 +9837,209 @@ TEST_F(ReplicationFactorLimitsTest, MaxReplicationFactor) {
   }
 }
 
+class ClientTestAutoIncrementingColumn : public ClientTest {
+ public:
+  void SetUp() override {
+    // TODO:achennaka Enable Feature flag here once implemented
+
+    KuduTest::SetUp();
+
+    // Start minicluster and wait for tablet servers to connect to master.
+    InternalMiniClusterOptions options;
+    options.num_tablet_servers = 3;
+    cluster_.reset(new InternalMiniCluster(env_, std::move(options)));
+    ASSERT_OK(cluster_->StartSync());
+    ASSERT_OK(cluster_->CreateClient(nullptr, &client_));
+  }
+};
+
+TEST_F(ClientTestAutoIncrementingColumn, ReadAndWrite) {
+  const string kTableName = "table_with_auto_incrementing_column";
+  KuduSchemaBuilder b;
+  // TODO(Marton): Once the NonUnique column Spec is in place
+  // update the column specs below to match the implementation
+  b.AddColumn("key")->Type(KuduColumnSchema::INT32)->NotNull()->PrimaryKey();
+  b.AddColumn("auto_incrementing_id")->Type(KuduColumnSchema::INT64)
+      ->NotNull()->AutoIncrementing();
+  ASSERT_OK(b.Build(&schema_));
+
+  // Create a table with a couple of range partitions
+  int lower_bound = 0;
+  int mid_bound = 10;
+  int upper_bound = 20;
+  unique_ptr<KuduPartialRow> lower0(schema_.NewRow());
+  unique_ptr<KuduPartialRow> upper0(schema_.NewRow());
+  unique_ptr<KuduPartialRow> lower1(schema_.NewRow());
+  unique_ptr<KuduPartialRow> upper1(schema_.NewRow());
+
+  ASSERT_OK(lower0->SetInt32("key", lower_bound));
+  ASSERT_OK(upper0->SetInt32("key", mid_bound));
+  ASSERT_OK(lower1->SetInt32("key", mid_bound));
+  ASSERT_OK(upper1->SetInt32("key", upper_bound));
+
+  unique_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
+  ASSERT_OK(table_creator->table_name(kTableName)
+            .schema(&schema_)
+            .set_range_partition_columns({"key"})
+            .add_range_partition(lower0.release(), upper0.release())
+            .add_range_partition(lower1.release(), upper1.release())
+            .num_replicas(3)
+            .Create());
+
+  // Write into these two partitions without specifying values for
+  // auto-incrementing column.
+  shared_ptr<KuduSession> session = client_->NewSession();
+  shared_ptr<KuduTable> table;
+  ASSERT_OK(client_->OpenTable(kTableName, &table));
+  static constexpr auto kNumRows = 20;
+  for (int i = 0; i < kNumRows; i++) {
+    unique_ptr<KuduInsert> insert(table->NewInsert());
+    KuduPartialRow* row = insert->mutable_row();
+    ASSERT_OK(row->SetInt32("key", i));
+    ASSERT_OK(session->Apply(insert.release()));
+  }
+  FlushSessionOrDie(session);
+
+  // Read back the rows and confirm the values of auto-incrementing column set
+  // correctly for each of the partitions in different scan modes.
+  for (const auto mode: {KuduClient::LEADER_ONLY, KuduClient::CLOSEST_REPLICA,
+                         KuduClient::FIRST_REPLICA}) {
+    vector<string> rows;
+    KuduScanner scanner(table.get());
+    ASSERT_OK(scanner.SetSelection(mode));
+    ASSERT_OK(ScanToStrings(&scanner, &rows));
+    ASSERT_EQ(kNumRows, rows.size());
+    for (int i = 0; i < rows.size(); i++) {
+      ASSERT_EQ(Substitute("(int32 key=$0, int64 auto_incrementing_id=$1)", i,
+                           (i % 10) + 1), rows[i]);
+    }
+  }
+}
+
+
+TEST_F(ClientTestAutoIncrementingColumn, ConcurrentWrites) {
+  const string kTableName = "concurrent_writes_auto_incrementing_column";
+  KuduSchemaBuilder b;
+  // TODO(Marton): Once the NonUnique column Spec is in place
+  // update the column specs below to match the implementation
+  b.AddColumn("key")->Type(KuduColumnSchema::INT32)->NotNull()->PrimaryKey();
+  b.AddColumn("auto_incrementing_id")->Type(KuduColumnSchema::INT64)
+      ->NotNull()->AutoIncrementing();
+  ASSERT_OK(b.Build(&schema_));
+
+  static constexpr int num_clients = 8;
+  static constexpr int num_rows_per_client = 1000;
+
+  // Create a table with a single range partition
+  static constexpr int lower_bound = 0;
+  static constexpr int upper_bound = num_clients * num_rows_per_client;
+  unique_ptr<KuduPartialRow> lower(schema_.NewRow());
+  unique_ptr<KuduPartialRow> upper(schema_.NewRow());
+
+  ASSERT_OK(lower->SetInt32("key", lower_bound));
+  ASSERT_OK(upper->SetInt32("key", upper_bound));
+
+  unique_ptr<KuduTableCreator> table_creator(client_->NewTableCreator());
+  ASSERT_OK(table_creator->table_name(kTableName)
+            .schema(&schema_)
+            .set_range_partition_columns({"key"})
+            .add_range_partition(lower.release(), upper.release())
+            .num_replicas(3)
+            .Create());
+
+  // Write into the table with eight clients concurrently without specifying values
+  // for the auto-incrementing column.
+  vector<shared_ptr<KuduClient>> clients;
+  CountDownLatch client_latch(num_clients);
+  vector<thread> threads;
+  for (int i = 0; i < num_clients; i++) {
+    threads.emplace_back([&, i] {
+      shared_ptr<KuduClient> client;
+      ASSERT_OK(KuduClientBuilder()
+                .add_master_server_addr(cluster_->mini_master()->bound_rpc_addr().ToString())
+                .Build(&client));
+      clients.emplace_back(client);
+      shared_ptr<KuduSession> session = client->NewSession();
+      shared_ptr<KuduTable> table;
+      ASSERT_OK(client->OpenTable(kTableName, &table));
+      for (int j = num_rows_per_client * i; j < num_rows_per_client * (i + 1); j++) {
+        unique_ptr<KuduInsert> insert(table->NewInsert());
+        KuduPartialRow *row = insert->mutable_row();
+        ASSERT_OK(row->SetInt32("key", j));
+        ASSERT_OK(session->Apply(insert.release()));
+      }
+      FlushSessionOrDie(session);
+      client_latch.CountDown();
+    });
+  }
+  client_latch.Wait();
+  for (int i = 0; i < threads.size(); i++) {
+    threads[i].join();
+  }
+  // Read back the rows and confirm the values of auto-incrementing column set
+  // correctly for each of the partitions in different scan modes.
+  static constexpr auto kNumRows = num_clients * num_rows_per_client;
+  vector<vector<string>> rows;
+  shared_ptr<KuduTable> table;
+  ASSERT_OK(client_->OpenTable(kTableName, &table));
+  for (const auto mode: {KuduClient::LEADER_ONLY, KuduClient::CLOSEST_REPLICA,
+                         KuduClient::FIRST_REPLICA}) {
+    vector<string> row;
+    KuduScanner scanner(table.get());
+    ASSERT_OK(scanner.SetSelection(mode));
+    ASSERT_OK(ScanToStrings(&scanner, &row));
+    ASSERT_EQ(kNumRows, row.size());
+    rows.push_back(row);
+  }
+  for (int i = 0; i < 2; i++) {
+    SCOPED_TRACE(i);
+    ASSERT_TRUE(rows[i] == rows[i + 1]);
+  }
+}
+
+TEST_F(ClientTestAutoIncrementingColumn, Negatives) {
+  // TODO(Marton): Once the NonUnique column Spec is in place
+  // update the column specs below to match the implementation
+  {
+    KuduSchemaBuilder b;
+    b.AddColumn("key")->Type(KuduColumnSchema::INT32)->NotNull()->PrimaryKey();
+    b.AddColumn("auto_incrementing_id")->Type(KuduColumnSchema::INT32)
+        ->NotNull()->AutoIncrementing();
+    Status s = b.Build(&schema_);
+    ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+    ASSERT_EQ("Invalid argument: auto-incrementing column should be of type INT64", s.ToString());
+  }
+
+  {
+    KuduSchemaBuilder b;
+    b.AddColumn("key")->Type(KuduColumnSchema::INT32)->NotNull()->PrimaryKey();
+    b.AddColumn("auto_incrementing_id")->Type(KuduColumnSchema::INT64)
+        ->Nullable()->AutoIncrementing();
+    Status s = b.Build(&schema_);
+    ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+    ASSERT_EQ("Invalid argument: auto-incrementing column should not be nullable", s.ToString());
+  }
+
+  {
+    KuduSchemaBuilder b;
+    b.AddColumn("key")->Type(KuduColumnSchema::INT32)->NotNull()->PrimaryKey();
+    b.AddColumn("auto_incrementing_id")->Type(KuduColumnSchema::INT64)
+        ->NotNull()->Default(KuduValue::FromInt(20))->AutoIncrementing();
+    Status s = b.Build(&schema_);
+    ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+    ASSERT_EQ("Invalid argument: auto-incrementing column cannot have a "
+                            "default value", s.ToString());
+  }
+
+  {
+    KuduSchemaBuilder b;
+    b.AddColumn("key")->Type(KuduColumnSchema::INT32)->NotNull()->PrimaryKey();
+    b.AddColumn("auto_incrementing_id")->Type(KuduColumnSchema::INT64)
+        ->NotNull()->Immutable()->AutoIncrementing();
+    Status s = b.Build(&schema_);
+    ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+    ASSERT_EQ("Invalid argument: auto-incrementing column should not be immutable", s.ToString());
+  }
+}
 } // namespace client
 } // namespace kudu
