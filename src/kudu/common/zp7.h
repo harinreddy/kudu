@@ -28,8 +28,9 @@ namespace kudu {
 // This implementation uses the CLMUL instruction set. Callers should
 // verify that the instruction is present (eg using base::CPU) before
 // calling.
+#ifdef HAS_CLMUL
 uint64_t zp7_pext_64_clmul(uint64_t a, uint64_t mask);
-
+#endif // HAS_CLMUL
 // This implementation is slower but doesn't require any special instructions.
 uint64_t zp7_pext_64_simple(uint64_t a, uint64_t mask);
 

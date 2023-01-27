@@ -193,6 +193,11 @@ elseif( NOT ( "${ARCH_NAME}" MATCHES "ppc64le" ))
   # -msse4.2: Enable sse4.2 compiler intrinsics.
   set(CXX_COMMON_FLAGS "-msse4.2")
 endif()
+# Architectures which support carryless multiply in hardware
+if( "${ARCH_NAME}" MATCHES "aarch64" OR "${ARCH_NAME}" MATCHES "x86_64")
+         add_definitions("-DHAS_CLMUL")
+endif()
+
 #  -Wall: Enable all warnings.
 set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -Wall")
 #  -Wno-sign-compare: suppress warnings for comparison between signed and unsigned

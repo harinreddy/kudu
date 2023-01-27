@@ -21,7 +21,9 @@
 #include "kudu/util/sse2neon.h" // IWYU pragma: keep
 #else
 #include <emmintrin.h>
+#ifdef __x86_64__
 #include <immintrin.h>
+#endif
 #endif
 
 #include <cstring>
@@ -221,11 +223,13 @@ void CopyNonNullBitmapImpl(
   bw.Flush();
 }
 
+#ifdef HAS_CLMUL
 struct PextZp7Clmul {
   inline static uint64_t call(uint64_t val, uint64_t mask) {
     return zp7_pext_64_clmul(val, mask);
   }
 };
+#endif // HAS_CLMUL
 struct PextZp7Simple {
   inline static uint64_t call(uint64_t val, uint64_t mask) {
     return zp7_pext_64_simple(val, mask);
