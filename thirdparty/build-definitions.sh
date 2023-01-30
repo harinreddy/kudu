@@ -341,7 +341,7 @@ build_llvm() {
     -DLLVM_INCLUDE_EXAMPLES=OFF \
     -DLLVM_INCLUDE_TESTS=OFF \
     -DLLVM_INCLUDE_UTILS=OFF \
-    -DLLVM_TARGETS_TO_BUILD="X86;AArch64;PowerPC" \
+    -DLLVM_TARGETS_TO_BUILD="X86;AArch64" \
     -DLLVM_ENABLE_RTTI=ON \
     -DCMAKE_CXX_FLAGS="$CLANG_CXXFLAGS" \
     -DCMAKE_EXE_LINKER_FLAGS="$CLANG_LDFLAGS" \
@@ -456,7 +456,6 @@ build_glog() {
       -DCMAKE_SHARED_LINKER_FLAGS="$EXTRA_LDFLAGS $EXTRA_LIBS -Wl,-rpath,$PREFIX/lib" \
       -DBUILD_SHARED_LIBS=$SHARED \
       -DBUILD_TESTING=OFF \
-      -DWITH_TLS=OFF \
       $EXTRA_CMAKE_FLAGS \
       $GLOG_SOURCE
     ${NINJA:-make} -j$PARALLEL $EXTRA_MAKEFLAGS install
@@ -790,6 +789,44 @@ build_breakpad() {
   BREAKPAD_BDIR=$TP_BUILD_DIR/$BREAKPAD_NAME$MODE_SUFFIX
   mkdir -p $BREAKPAD_BDIR
   pushd $BREAKPAD_BDIR
+
+if [ `uname -m` = "ppc64le" ]
+then
+  pushd $TP_DIR/src
+
+#  rm -rf $BREAKPAD_SOURCE/*
+#  cp -rf /kudu/tools//breakpad/breakpad-new/* $BREAKPAD_SOURCE/
+
+#breakpad build script
+rm -rf breakpad linux-syscall-support
+git clone https://chromium.googlesource.com/breakpad/breakpad
+
+#fetch , patch and copy linux-syscall-support
+git clone https://chromium.googlesource.com/linux-syscall-support
+cd linux-syscall-support/
+git fetch https://chromium.googlesource.com/linux-syscall-support refs/changes/73/1430973/4 && git checkout FETCH_HEAD
+cd ../breakpad
+mkdir -p src/third_party/lss
+cp ../linux-syscall-support/linux_syscall_support.h src/third_party/lss/
+
+cd ..
+
+# download google test and copy the contents to breakpad/src/testing - needed for make check
+#wget https://github.com/google/googletest/archive/refs/tags/release-1.8.1.tar.gz
+#tar -xvf release-1.12.1.tar.gz
+mkdir -p breakpad/src/testing
+cp -r googletest-release-1.12.1/google* breakpad/src/testing
+
+cd breakpad
+#fetch patch 21 https://chromium-review.googlesource.com/c/breakpad/breakpad/+/1426283/21
+git fetch https://chromium.googlesource.com/breakpad/breakpad refs/changes/83/1426283/21 && git checkout FETCH_HEAD
+cd ../
+mv $BREAKPAD_SOURCE $BREAKPAD_SOURCE-"$(date +"%Y_%m_%d_%I_%M_%p")"
+
+mv breakpad $BREAKPAD_SOURCE
+rm -rf linux-syscall-support
+popd
+fi
 
   CFLAGS="$EXTRA_CFLAGS" \
     CXXFLAGS="$EXTRA_CXXFLAGS" \
@@ -1151,36 +1188,6 @@ build_jwt_cpp() {
     -DCMAKE_INSTALL_PREFIX=$PREFIX \
     -DJWT_BUILD_EXAMPLES=OFF \
     $JWT_CPP_SOURCE
-  make -j$PARALLEL install
-  popd
-}
-
-build_rocksdb() {
-  ROCKSDB_BUILD_DIR=$TP_BUILD_DIR/$ROCKSDB_NAME$MODE_SUFFIX
-  mkdir -p $ROCKSDB_BUILD_DIR
-  pushd $ROCKSDB_BUILD_DIR
-  rm -Rf CMakeCache.txt CMakeFiles/
-  CFLAGS="$EXTRA_CFLAGS -fPIC" \
-    CXXFLAGS="$EXTRA_CXXFLAGS -fPIC" \
-    cmake \
-    -DROCKSDB_BUILD_SHARED=ON \
-    -DFAIL_ON_WARNINGS=OFF \
-    -DWITH_BENCHMARK_TOOLS=OFF \
-    -DWITH_CORE_TOOLS=OFF \
-    -DWITH_TOOLS=OFF \
-    -DWITH_TRACE_TOOLS=OFF \
-    -DWITH_JNI=OFF \
-    -DWITH_LIBURING=OFF \
-    -DWITH_LZ4=ON \
-    -DWITH_ZSTD=OFF \
-    -DWITH_SNAPPY=ON \
-    -DWITH_BZ2=OFF \
-    -DWITH_TESTS=OFF \
-    -DWITH_GFLAGS=OFF \
-    -DCMAKE_BUILD_TYPE=release \
-    -DCMAKE_INSTALL_PREFIX=$PREFIX \
-    -DCMAKE_SHARED_LINKER_FLAGS="$EXTRA_LDFLAGS $EXTRA_LIBS -Wl,-rpath,$PREFIX/lib" \
-    $ROCKSDB_SOURCE
   make -j$PARALLEL install
   popd
 }
